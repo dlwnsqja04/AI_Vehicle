@@ -1,0 +1,1137 @@
+package com.example.vehiclelicensereportapp
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.core.content.ContextCompat
+import com.example.vehiclelicensereportapp.ui.theme.VehicleLicenseReportAppTheme
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            VehicleLicenseReportAppTheme {
+                PlateReportApp()
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlateReportApp() {
+    val context = LocalContext.current
+    var currentScreen by remember { mutableStateOf(AppScreen.Home) }
+    var selectedCategory by remember { mutableStateOf<ViolationCategory?>(null) }
+    var selectedViolationType by remember { mutableStateOf("") }
+    var recognizedPlate by remember { mutableStateOf("") }
+    var recognizedOcrText by remember { mutableStateOf("") }
+    var capturedPhotoFileName by remember { mutableStateOf("") }
+    var reportContent by remember { mutableStateOf("") }
+    var phoneNumberDigits by remember { mutableStateOf("") }
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasCameraPermission = granted
+    }
+
+    LaunchedEffect(currentScreen) {
+        if (currentScreen == AppScreen.Camera && !hasCameraPermission) {
+            permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        Surface(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding),
+            color = Color.White
+        ) {
+            when (currentScreen) {
+                AppScreen.Home -> HomeScreen(
+                    onReportClick = { currentScreen = AppScreen.Category },
+                    onHistoryClick = {
+                        Toast.makeText(context, "신고내역 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
+                    },
+                    onProfileClick = {
+                        Toast.makeText(context, "프로필 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
+                    }
+                )
+
+                AppScreen.Category -> ViolationCategoryScreen(
+                    onBackClick = { currentScreen = AppScreen.Home },
+                    onCategorySelected = { category ->
+                        selectedCategory = category
+                        currentScreen = AppScreen.ViolationType
+                    }
+                )
+
+                AppScreen.ViolationType -> ViolationTypeScreen(
+                    category = selectedCategory,
+                    onBackClick = { currentScreen = AppScreen.Category },
+                    onViolationTypeSelected = { violationType ->
+                        selectedViolationType = violationType
+                        currentScreen = AppScreen.Camera
+                    }
+                )
+
+                AppScreen.Camera -> {
+                    if (hasCameraPermission) {
+                        CameraOcrScreen(
+                            categoryName = selectedCategory?.name.orEmpty(),
+                            violationType = selectedViolationType,
+                            onBackClick = { currentScreen = AppScreen.ViolationType },
+                            onPlateRecognized = { ocrText, plate, fileName ->
+                                recognizedOcrText = ocrText
+                                recognizedPlate = plate
+                                capturedPhotoFileName = fileName
+                                currentScreen = AppScreen.PlateConfirm
+                            }
+                        )
+                    } else {
+                        PermissionScreen(
+                            onBackClick = { currentScreen = AppScreen.ViolationType },
+                            onRequestPermission = {
+                                permissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
+                        )
+                    }
+                }
+
+                AppScreen.PlateConfirm -> PlateConfirmScreen(
+                    plate = recognizedPlate,
+                    onPlateChange = { recognizedPlate = it },
+                    onRetakeClick = { currentScreen = AppScreen.Camera },
+                    onNextClick = { currentScreen = AppScreen.ReportDetail }
+                )
+
+                AppScreen.ReportDetail -> ReportDetailScreen(
+                    violationType = selectedViolationType,
+                    photoFileName = capturedPhotoFileName,
+                    plate = recognizedPlate,
+                    content = reportContent,
+                    phoneNumber = phoneNumberDigits,
+                    onPlateChange = { recognizedPlate = it },
+                    onContentChange = { reportContent = it.take(900) },
+                    onPhoneNumberChange = { phoneNumberDigits = it.filter { char -> char.isDigit() }.take(11) },
+                    onBackClick = { currentScreen = AppScreen.PlateConfirm },
+                    onNextClick = { currentScreen = AppScreen.FalseReportWarning }
+                )
+
+                AppScreen.FalseReportWarning -> FalseReportWarningScreen(
+                    onBackClick = { currentScreen = AppScreen.ReportDetail },
+                    onReportClick = {
+                        Toast.makeText(context, "신고 기능은 다음 단계에서 연결합니다.", Toast.LENGTH_SHORT).show()
+                    }
+                )
+            }
+        }
+    }
+}
+
+private enum class AppScreen {
+    Home,
+    Category,
+    ViolationType,
+    Camera,
+    PlateConfirm,
+    ReportDetail,
+    FalseReportWarning
+}
+
+private data class ViolationCategory(
+    val name: String,
+    val description: String,
+    val types: List<String>
+)
+
+private val violationCategories = listOf(
+    ViolationCategory(
+        name = "도로교통법",
+        description = "일반 도로의 불법 주정차 신고 유형",
+        types = listOf("소화전", "교차로", "버스정류장", "횡단보도", "어린이보호구역", "인도", "기타")
+    ),
+    ViolationCategory(
+        name = "장애인등 편의법",
+        description = "장애인 전용 주차구역 위반 신고 유형",
+        types = listOf("장애인 전용구역")
+    ),
+    ViolationCategory(
+        name = "소방기본법",
+        description = "소방 활동 공간 침해 신고 유형",
+        types = listOf("소방차 전용구역")
+    ),
+    ViolationCategory(
+        name = "친환경 자동차법",
+        description = "친환경차 충전 방해 신고 유형",
+        types = listOf("친환경차 충전구역")
+    )
+)
+
+private val tileGradients = listOf(
+    listOf(Color(0xFF5ED477), Color(0xFF27C4B2)),
+    listOf(Color(0xFF31CBB2), Color(0xFF2AC8C8)),
+    listOf(Color(0xFF17B7D5), Color(0xFF25C4D8)),
+    listOf(Color(0xFF43A7E7), Color(0xFF438FE2)),
+    listOf(Color(0xFF4E73E8), Color(0xFF4367DF)),
+    listOf(Color(0xFF426FE2), Color(0xFF3F62D8))
+)
+
+private val primaryButtonColor = Color(0xFF456AE3)
+private val headingColor = Color(0xFF202638)
+private val bodyTextColor = Color(0xFF6D7485)
+
+@Composable
+private fun HomeScreen(
+    onReportClick: () -> Unit,
+    onHistoryClick: () -> Unit,
+    onProfileClick: () -> Unit
+) {
+    val context = LocalContext.current
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(modifier = Modifier.height(30.dp))
+        Text(
+            text = "불법 주정차 신고",
+            fontSize = 32.sp,
+            lineHeight = 38.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "대한민국의 깨끗한 도로를 위해",
+            fontSize = 17.sp,
+            lineHeight = 24.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(34.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            GradientMenuCard(
+                modifier = Modifier.weight(1f),
+                title = "신고하기",
+                subtitle = "번호판 촬영",
+                gradient = tileGradients[0],
+                onClick = onReportClick
+            )
+            GradientMenuCard(
+                modifier = Modifier.weight(1f),
+                title = "신고내역",
+                subtitle = "기록 확인",
+                gradient = tileGradients[1],
+                onClick = onHistoryClick
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            GradientMenuCard(
+                modifier = Modifier.weight(1f),
+                title = "프로필",
+                subtitle = "내 정보",
+                gradient = tileGradients[2],
+                onClick = onProfileClick
+            )
+            GradientMenuCard(
+                modifier = Modifier.weight(1f),
+                title = "도움말",
+                subtitle = "신고 기준",
+                gradient = tileGradients[3],
+                onClick = {
+                    Toast.makeText(context, "도움말 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun GradientMenuCard(
+    modifier: Modifier = Modifier,
+    title: String,
+    subtitle: String,
+    gradient: List<Color>,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = modifier
+            .height(132.dp)
+            .shadow(8.dp, RoundedCornerShape(8.dp), clip = false),
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.Transparent)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.linearGradient(gradient))
+                .padding(horizontal = 24.dp, vertical = 26.dp)
+        ) {
+            Column(
+                modifier = Modifier.align(Alignment.TopStart),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = title,
+                    fontSize = 22.sp,
+                    lineHeight = 26.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color.White
+                )
+                Text(
+                    text = subtitle,
+                    fontSize = 15.sp,
+                    lineHeight = 20.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color.White.copy(alpha = 0.92f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PrimaryActionButton(
+    modifier: Modifier = Modifier,
+    text: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true
+) {
+    Button(
+        modifier = modifier.height(50.dp),
+        enabled = enabled,
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = primaryButtonColor,
+            contentColor = Color.White,
+            disabledContainerColor = primaryButtonColor.copy(alpha = 0.45f),
+            disabledContentColor = Color.White.copy(alpha = 0.75f)
+        )
+    ) {
+        Text(text = text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun ViolationCategoryScreen(
+    onBackClick: () -> Unit,
+    onCategorySelected: (ViolationCategory) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(modifier = Modifier.height(30.dp))
+        Text(
+            text = "불법 주정차 위반유형 선택",
+            fontSize = 28.sp,
+            lineHeight = 34.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "먼저 신고 기준이 되는 법령 카테고리를 선택하세요.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        violationCategories.forEachIndexed { index, category ->
+            GradientMenuCard(
+                title = category.name,
+                subtitle = category.description,
+                gradient = tileGradients[index % tileGradients.size],
+                onClick = { onCategorySelected(category) }
+            )
+        }
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "메인으로 돌아가기",
+            onClick = onBackClick
+        )
+    }
+}
+
+@Composable
+private fun ViolationTypeScreen(
+    category: ViolationCategory?,
+    onBackClick: () -> Unit,
+    onViolationTypeSelected: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(modifier = Modifier.height(30.dp))
+        Text(
+            text = category?.name ?: "위반유형 선택",
+            fontSize = 28.sp,
+            lineHeight = 34.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "세부 위반유형을 선택하면 차량 촬영 화면으로 이동합니다.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        category?.types.orEmpty().forEach { violationType ->
+            PrimaryActionButton(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                text = violationType,
+                onClick = { onViolationTypeSelected(violationType) }
+            )
+        }
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "카테고리 선택으로 돌아가기",
+            onClick = onBackClick
+        )
+    }
+}
+
+@Composable
+private fun PermissionScreen(
+    onBackClick: () -> Unit,
+    onRequestPermission: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "번호판 인식을 위해 카메라 권한이 필요합니다.",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = headingColor
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "카메라 권한 허용",
+            onClick = onRequestPermission
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "위반유형 선택으로 돌아가기",
+            onClick = onBackClick
+        )
+    }
+}
+
+@Composable
+private fun CameraOcrScreen(
+    categoryName: String,
+    violationType: String,
+    onBackClick: () -> Unit,
+    onPlateRecognized: (ocrText: String, plate: String, fileName: String) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    val imageCapture = remember {
+        ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .build()
+    }
+
+    var isProcessing by remember { mutableStateOf(false) }
+    var firstPhotoFileName by remember { mutableStateOf("") }
+    val captureMessage = if (firstPhotoFileName.isBlank()) {
+        "차량 앞 뒤 총 2장을 찍어주세요"
+    } else {
+        "한번 더찍어주세요"
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            cameraExecutor.shutdown()
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { viewContext ->
+                    val previewView = PreviewView(viewContext)
+                    val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
+
+                    cameraProviderFuture.addListener(
+                        {
+                            val cameraProvider = cameraProviderFuture.get()
+                            val preview = Preview.Builder().build().also {
+                                it.setSurfaceProvider(previewView.surfaceProvider)
+                            }
+
+                            cameraProvider.unbindAll()
+                            cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                CameraSelector.DEFAULT_BACK_CAMERA,
+                                preview,
+                                imageCapture
+                            )
+                        },
+                        ContextCompat.getMainExecutor(viewContext)
+                    )
+
+                    previewView
+                }
+            )
+
+            if (isProcessing) {
+                CircularProgressIndicator(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(48.dp)
+                )
+            }
+
+            CaptureNotice(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 18.dp),
+                message = captureMessage
+            )
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 28.dp)
+                    .size(82.dp)
+                    .background(Color.White.copy(alpha = 0.32f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(Color.White, CircleShape)
+                        .border(1.dp, Color.White, CircleShape)
+                        .clickable(enabled = !isProcessing) {
+                            isProcessing = true
+                            captureAndRecognizePlate(
+                                context = context,
+                                imageCapture = imageCapture,
+                                executor = cameraExecutor,
+                                onResult = { ocrText, plate, fileName ->
+                                    isProcessing = false
+                                    if (firstPhotoFileName.isBlank()) {
+                                        firstPhotoFileName = fileName
+                                    } else {
+                                        onPlateRecognized(ocrText, plate, "$firstPhotoFileName, $fileName")
+                                    }
+                                },
+                                onError = { message ->
+                                    isProcessing = false
+                                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                        }
+                )
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                text = "선택한 카테고리: $categoryName",
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = headingColor
+            )
+            Text(
+                text = "선택한 유형: $violationType",
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = headingColor
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                PrimaryActionButton(
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isProcessing,
+                    text = "이전",
+                    onClick = onBackClick
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CaptureNotice(
+    modifier: Modifier = Modifier,
+    message: String
+) {
+    Row(
+        modifier = modifier
+            .background(Color.White, RoundedCornerShape(28.dp))
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(22.dp)
+                .background(Color(0xFFFFC107), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "!",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.ExtraBold
+            )
+        }
+        Text(
+            text = message,
+            color = Color.Black,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+private fun InlineWarningBanner(
+    modifier: Modifier = Modifier,
+    message: String
+) {
+    Row(
+        modifier = modifier
+            .background(Color.White, RoundedCornerShape(28.dp))
+            .shadow(4.dp, RoundedCornerShape(28.dp), clip = false)
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .background(Color(0xFFFFC107), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "!",
+                color = Color.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.ExtraBold
+            )
+        }
+        Text(
+            text = message,
+            color = Color.Black,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+private fun PlateConfirmScreen(
+    plate: String,
+    onPlateChange: (String) -> Unit,
+    onRetakeClick: () -> Unit,
+    onNextClick: () -> Unit
+) {
+    var warningMessage by remember { mutableStateOf("") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(modifier = Modifier.height(28.dp))
+        if (warningMessage.isNotBlank()) {
+            InlineWarningBanner(
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+                message = warningMessage
+            )
+            Spacer(modifier = Modifier.height(20.dp))
+        } else {
+            Spacer(modifier = Modifier.height(64.dp))
+        }
+        Text(
+            text = "이 번호가 맞습니까?",
+            fontSize = 30.sp,
+            lineHeight = 36.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "다시한번 정확한지 확인해주세요",
+            fontSize = 17.sp,
+            lineHeight = 24.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = plate,
+            onValueChange = onPlateChange,
+            label = { Text(text = "번호판 확인/수정") },
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "다시찍기",
+                onClick = onRetakeClick
+            )
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "다음으로",
+                onClick = {
+                    if (plate.isBlank()) {
+                        warningMessage = "번호판을 입력해주세요"
+                    } else {
+                        warningMessage = ""
+                        onNextClick()
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReportDetailScreen(
+    violationType: String,
+    photoFileName: String,
+    plate: String,
+    content: String,
+    phoneNumber: String,
+    onPlateChange: (String) -> Unit,
+    onContentChange: (String) -> Unit,
+    onPhoneNumberChange: (String) -> Unit,
+    onBackClick: () -> Unit,
+    onNextClick: () -> Unit
+) {
+    var warningMessage by remember { mutableStateOf("") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(modifier = Modifier.height(24.dp))
+        if (warningMessage.isNotBlank()) {
+            InlineWarningBanner(
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+                message = warningMessage
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+        } else {
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+        Text(
+            text = "신고 정보 확인",
+            fontSize = 30.sp,
+            lineHeight = 36.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "제출 전 번호판과 신고 유형을 확인해주세요",
+            fontSize = 17.sp,
+            lineHeight = 24.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(18.dp))
+
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = violationType,
+            onValueChange = {},
+            label = { Text(text = "유형") },
+            singleLine = true,
+            readOnly = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+        )
+
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = photoFileName,
+            onValueChange = {},
+            label = { Text(text = "첨부사진") },
+            singleLine = true,
+            readOnly = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+        )
+
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = plate,
+            onValueChange = onPlateChange,
+            label = { Text(text = "번호판 확인/수정") },
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+        )
+
+        OutlinedTextField(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(150.dp),
+            value = content,
+            onValueChange = onContentChange,
+            label = {
+                Text(
+                    text = "내용 (수정 가능, 5~900자)",
+                    fontSize = 13.sp
+                )
+            },
+            placeholder = { Text(text = "불법 주정차 위반 사항을 신고해 주세요.") },
+            minLines = 5,
+            maxLines = 5,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.Black)
+        )
+
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = phoneNumber,
+            onValueChange = onPhoneNumberChange,
+            label = { Text(text = "휴대전화") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            visualTransformation = PhoneNumberVisualTransformation,
+            placeholder = { Text(text = "010 - 1234 - 5678") },
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+        )
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "이전",
+                onClick = onBackClick
+            )
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "다음으로",
+                onClick = {
+                    if (plate.isBlank() || content.length < 5 || phoneNumber.length != 11) {
+                        warningMessage = "알맞은 양식으로 입력해주세요"
+                    } else {
+                        warningMessage = ""
+                        onNextClick()
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun FalseReportWarningScreen(
+    onBackClick: () -> Unit,
+    onReportClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(86.dp)
+                .background(Color(0xFFFFC107), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "!",
+                color = Color.White,
+                fontSize = 52.sp,
+                fontWeight = FontWeight.ExtraBold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(22.dp))
+
+        Text(
+            text = "한번 더 확인해주세요",
+            fontSize = 24.sp,
+            lineHeight = 30.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "허위 신고시 무고죄 또는 공무집행방해죄로 법적 처벌을 받을 수 있습니다",
+            fontSize = 15.sp,
+            lineHeight = 22.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(36.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "이전",
+                onClick = onBackClick
+            )
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "신고하기",
+                onClick = onReportClick
+            )
+        }
+    }
+}
+
+private fun captureAndRecognizePlate(
+    context: Context,
+    imageCapture: ImageCapture,
+    executor: ExecutorService,
+    onResult: (ocrText: String, plate: String, fileName: String) -> Unit,
+    onError: (message: String) -> Unit
+) {
+    val photoFile = File(
+        context.cacheDir,
+        "plate_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())}.jpg"
+    )
+    val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+    imageCapture.takePicture(
+        outputOptions,
+        executor,
+        object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                val uri = outputFileResults.savedUri ?: Uri.fromFile(photoFile)
+                recognizePlateFromImage(
+                    context = context,
+                    uri = uri,
+                    fileName = photoFile.name,
+                    onResult = onResult,
+                    onError = onError
+                )
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                onError("사진 촬영에 실패했습니다: ${exception.message}")
+            }
+        }
+    )
+}
+
+private fun recognizePlateFromImage(
+    context: Context,
+    uri: Uri,
+    fileName: String,
+    onResult: (ocrText: String, plate: String, fileName: String) -> Unit,
+    onError: (message: String) -> Unit
+) {
+    val image = InputImage.fromFilePath(context, uri)
+    val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+
+    recognizer.process(image)
+        .addOnSuccessListener { result ->
+            val ocrText = result.text
+            onResult(ocrText, findKoreanPlateCandidate(ocrText), fileName)
+        }
+        .addOnFailureListener { exception ->
+            onError("번호판 인식에 실패했습니다: ${exception.message}")
+        }
+}
+
+private fun findKoreanPlateCandidate(text: String): String {
+    val normalized = text.replace(Regex("[^0-9가-힣]"), "")
+    val plateRegex = Regex("[0-9]{2,3}[가-힣][0-9]{4}")
+    return plateRegex.find(normalized)?.value.orEmpty()
+}
+
+private object PhoneNumberVisualTransformation : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val digits = text.text.filter { it.isDigit() }.take(11)
+        val formatted = when {
+            digits.length <= 3 -> digits
+            digits.length <= 7 -> "${digits.take(3)} - ${digits.drop(3)}"
+            else -> "${digits.take(3)} - ${digits.drop(3).take(4)} - ${digits.drop(7)}"
+        }
+
+        val offsetMapping = object : OffsetMapping {
+            override fun originalToTransformed(offset: Int): Int {
+                val safeOffset = offset.coerceIn(0, digits.length)
+                return when {
+                    safeOffset <= 3 -> safeOffset
+                    safeOffset <= 7 -> safeOffset + 3
+                    else -> safeOffset + 6
+                }
+            }
+
+            override fun transformedToOriginal(offset: Int): Int {
+                val safeOffset = offset.coerceIn(0, formatted.length)
+                return when {
+                    safeOffset <= 3 -> safeOffset
+                    safeOffset <= 6 -> 3
+                    safeOffset <= 10 -> safeOffset - 3
+                    safeOffset <= 13 -> 7
+                    else -> safeOffset - 6
+                }.coerceIn(0, digits.length)
+            }
+        }
+
+        return TransformedText(AnnotatedString(formatted), offsetMapping)
+    }
+}
