@@ -3,6 +3,10 @@ package com.example.vehiclelicensereportapp
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
@@ -19,6 +23,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
@@ -54,8 +59,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
@@ -68,18 +75,26 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.core.content.ContextCompat
 import com.example.vehiclelicensereportapp.ui.theme.VehicleLicenseReportAppTheme
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.Mat
+import org.opencv.core.Size as CvSize
+import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+// 앱의 시작점입니다. Compose 화면을 띄우고 전체 화면 흐름을 시작합니다.
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -92,6 +107,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// 앱의 현재 화면 상태와 입력값을 관리하는 최상위 Compose 화면입니다.
+// 별도 Navigation 라이브러리 없이 enum 상태로 화면을 전환합니다.
 @Composable
 private fun PlateReportApp() {
     val context = LocalContext.current
@@ -210,6 +227,7 @@ private fun PlateReportApp() {
     }
 }
 
+// 사용자가 이동할 수 있는 화면 목록입니다.
 private enum class AppScreen {
     Home,
     Category,
@@ -220,12 +238,14 @@ private enum class AppScreen {
     FalseReportWarning
 }
 
+// 법령 카테고리와 그 아래에 들어갈 세부 위반유형 목록을 담는 데이터 구조입니다.
 private data class ViolationCategory(
     val name: String,
     val description: String,
     val types: List<String>
 )
 
+// 신고 유형 선택 화면에서 보여줄 법령 카테고리 데이터입니다.
 private val violationCategories = listOf(
     ViolationCategory(
         name = "도로교통법",
@@ -249,6 +269,7 @@ private val violationCategories = listOf(
     )
 )
 
+// 메인/카테고리 카드 버튼에 사용하는 그라데이션 색상 모음입니다.
 private val tileGradients = listOf(
     listOf(Color(0xFF5ED477), Color(0xFF27C4B2)),
     listOf(Color(0xFF31CBB2), Color(0xFF2AC8C8)),
@@ -258,10 +279,18 @@ private val tileGradients = listOf(
     listOf(Color(0xFF426FE2), Color(0xFF3F62D8))
 )
 
+// 앱 전반에서 반복 사용하는 주요 색상입니다.
 private val primaryButtonColor = Color(0xFF456AE3)
 private val headingColor = Color(0xFF202638)
 private val bodyTextColor = Color(0xFF6D7485)
 
+// 카메라 화면의 번호판 가이드 박스 비율입니다.
+// 예시 번호판처럼 가로로 길고 낮은 직사각형이 되도록 약 5:1 비율에 맞췄습니다.
+private const val PLATE_GUIDE_WIDTH_RATIO = 0.82f
+private const val PLATE_GUIDE_HEIGHT_RATIO = 0.10f
+private const val PLATE_GUIDE_TOP_RATIO = 0.42f
+
+// 앱 첫 화면입니다. 신고하기, 신고내역, 프로필, 도움말 버튼을 보여줍니다.
 @Composable
 private fun HomeScreen(
     onReportClick: () -> Unit,
@@ -338,6 +367,7 @@ private fun HomeScreen(
     }
 }
 
+// 그라데이션이 들어간 큰 메뉴 카드입니다. 메인 메뉴와 카테고리 선택에 함께 사용합니다.
 @Composable
 private fun GradientMenuCard(
     modifier: Modifier = Modifier,
@@ -383,6 +413,7 @@ private fun GradientMenuCard(
     }
 }
 
+// 파란색 기본 액션 버튼입니다. 이전/다음/신고하기 같은 주요 버튼에 공통 적용합니다.
 @Composable
 private fun PrimaryActionButton(
     modifier: Modifier = Modifier,
@@ -406,6 +437,7 @@ private fun PrimaryActionButton(
     }
 }
 
+// 신고하기를 눌렀을 때 먼저 보이는 법령 카테고리 선택 화면입니다.
 @Composable
 private fun ViolationCategoryScreen(
     onBackClick: () -> Unit,
@@ -454,6 +486,7 @@ private fun ViolationCategoryScreen(
     }
 }
 
+// 선택한 법령 카테고리에 맞는 세부 위반유형 목록을 보여주는 화면입니다.
 @Composable
 private fun ViolationTypeScreen(
     category: ViolationCategory?,
@@ -504,6 +537,7 @@ private fun ViolationTypeScreen(
     }
 }
 
+// 카메라 권한이 없을 때 권한 요청 버튼을 보여주는 화면입니다.
 @Composable
 private fun PermissionScreen(
     onBackClick: () -> Unit,
@@ -537,6 +571,8 @@ private fun PermissionScreen(
     }
 }
 
+// 카메라 프리뷰 화면입니다.
+// 중앙의 번호판 가이드 박스에 맞춰 2장을 촬영하고, 두 번째 촬영 후 OCR 결과 화면으로 이동합니다.
 @Composable
 private fun CameraOcrScreen(
     categoryName: String,
@@ -616,6 +652,8 @@ private fun CameraOcrScreen(
                 message = captureMessage
             )
 
+            PlateGuideOverlay(modifier = Modifier.fillMaxSize())
+
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -688,6 +726,7 @@ private fun CameraOcrScreen(
     }
 }
 
+// 카메라 화면 상단에 표시되는 흰색 안내 배너입니다.
 @Composable
 private fun CaptureNotice(
     modifier: Modifier = Modifier,
@@ -722,6 +761,27 @@ private fun CaptureNotice(
     }
 }
 
+// 번호판을 맞춰 찍을 수 있도록 카메라 프리뷰 위에 그리는 흰색 가이드 박스입니다.
+@Composable
+private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val guideWidth = size.width * PLATE_GUIDE_WIDTH_RATIO
+        val guideHeight = size.height * PLATE_GUIDE_HEIGHT_RATIO
+        val left = (size.width - guideWidth) / 2f
+        val top = size.height * PLATE_GUIDE_TOP_RATIO
+        val right = left + guideWidth
+        val bottom = top + guideHeight
+        val stroke = Stroke(width = 10.dp.toPx(), cap = StrokeCap.Round)
+        val color = Color.White
+
+        drawLine(color, Offset(left, top), Offset(right, top), strokeWidth = stroke.width, cap = StrokeCap.Round)
+        drawLine(color, Offset(right, top), Offset(right, bottom), strokeWidth = stroke.width, cap = StrokeCap.Round)
+        drawLine(color, Offset(right, bottom), Offset(left, bottom), strokeWidth = stroke.width, cap = StrokeCap.Round)
+        drawLine(color, Offset(left, bottom), Offset(left, top), strokeWidth = stroke.width, cap = StrokeCap.Round)
+    }
+}
+
+// 입력값이 부족하거나 형식이 맞지 않을 때 보여주는 공통 경고 배너입니다.
 @Composable
 private fun InlineWarningBanner(
     modifier: Modifier = Modifier,
@@ -757,6 +817,7 @@ private fun InlineWarningBanner(
     }
 }
 
+// OCR로 읽은 번호판을 사용자가 확인하고 수정하는 화면입니다.
 @Composable
 private fun PlateConfirmScreen(
     plate: String,
@@ -837,6 +898,7 @@ private fun PlateConfirmScreen(
     }
 }
 
+// 최종 신고 전에 유형, 첨부사진, 번호판, 내용, 휴대전화를 확인하고 입력하는 화면입니다.
 @Composable
 private fun ReportDetailScreen(
     violationType: String,
@@ -973,6 +1035,7 @@ private fun ReportDetailScreen(
     }
 }
 
+// 허위 신고에 대한 법적 책임을 한 번 더 안내하는 최종 경고 화면입니다.
 @Composable
 private fun FalseReportWarningScreen(
     onBackClick: () -> Unit,
@@ -1040,6 +1103,7 @@ private fun FalseReportWarningScreen(
     }
 }
 
+// CameraX로 사진을 파일에 저장한 뒤 OCR 처리 함수로 넘깁니다.
 private fun captureAndRecognizePlate(
     context: Context,
     imageCapture: ImageCapture,
@@ -1075,6 +1139,7 @@ private fun captureAndRecognizePlate(
     )
 }
 
+// 저장된 사진에서 번호판 가이드 영역만 잘라내고 보정한 뒤 ML Kit OCR을 실행합니다.
 private fun recognizePlateFromImage(
     context: Context,
     uri: Uri,
@@ -1082,7 +1147,16 @@ private fun recognizePlateFromImage(
     onResult: (ocrText: String, plate: String, fileName: String) -> Unit,
     onError: (message: String) -> Unit
 ) {
-    val image = InputImage.fromFilePath(context, uri)
+    val enhancedPlateBitmap = runCatching {
+        val originalBitmap = loadOrientedBitmap(context, uri)
+        val croppedPlateBitmap = cropPlateGuideArea(originalBitmap)
+        enhancePlateBitmap(croppedPlateBitmap)
+    }.getOrElse { exception ->
+        onError("번호판 영역 보정에 실패했습니다: ${exception.message}")
+        return
+    }
+
+    val image = InputImage.fromBitmap(enhancedPlateBitmap, 0)
     val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
 
     recognizer.process(image)
@@ -1095,12 +1169,93 @@ private fun recognizePlateFromImage(
         }
 }
 
+// 촬영 이미지에 저장된 EXIF 회전 정보를 읽어 실제 방향에 맞는 Bitmap으로 돌려줍니다.
+private fun loadOrientedBitmap(context: Context, uri: Uri): Bitmap {
+    val bitmap = context.contentResolver.openInputStream(uri).use { inputStream ->
+        BitmapFactory.decodeStream(inputStream)
+    } ?: error("이미지를 읽을 수 없습니다.")
+
+    val rotationDegrees = context.contentResolver.openInputStream(uri).use { inputStream ->
+        val exifInputStream = inputStream ?: return@use 0f
+        when (ExifInterface(exifInputStream).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL
+        )) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+    }
+
+    if (rotationDegrees == 0f) return bitmap
+
+    val matrix = Matrix().apply { postRotate(rotationDegrees) }
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+}
+
+// 화면의 번호판 가이드 박스와 같은 비율로 원본 사진의 중앙 영역을 잘라냅니다.
+private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
+    val cropWidth = (bitmap.width * PLATE_GUIDE_WIDTH_RATIO).toInt().coerceAtLeast(1)
+    val cropHeight = (bitmap.height * PLATE_GUIDE_HEIGHT_RATIO).toInt().coerceAtLeast(1)
+    val left = ((bitmap.width - cropWidth) / 2).coerceIn(0, bitmap.width - 1)
+    val top = (bitmap.height * PLATE_GUIDE_TOP_RATIO).toInt().coerceIn(0, bitmap.height - 1)
+    val safeWidth = cropWidth.coerceAtMost(bitmap.width - left)
+    val safeHeight = cropHeight.coerceAtMost(bitmap.height - top)
+
+    return Bitmap.createBitmap(bitmap, left, top, safeWidth, safeHeight)
+}
+
+// 잘라낸 번호판 이미지를 OCR이 읽기 쉽게 OpenCV로 전처리합니다.
+// 확대 -> 흑백 변환 -> 명암 보정 -> 선명화 -> 이진화 순서로 처리합니다.
+private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val scaledBitmap = Bitmap.createScaledBitmap(bitmap, bitmap.width * 2, bitmap.height * 2, true)
+    val rgba = Mat()
+    val gray = Mat()
+    val blurred = Mat()
+    val sharpened = Mat()
+    val threshold = Mat()
+
+    return try {
+        Utils.bitmapToMat(scaledBitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.equalizeHist(gray, gray)
+        Imgproc.GaussianBlur(gray, blurred, CvSize(0.0, 0.0), 3.0)
+        Core.addWeighted(gray, 1.5, blurred, -0.5, 0.0, sharpened)
+        Imgproc.adaptiveThreshold(
+            sharpened,
+            threshold,
+            255.0,
+            Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
+            Imgproc.THRESH_BINARY,
+            31,
+            7.0
+        )
+
+        Bitmap.createBitmap(threshold.cols(), threshold.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(threshold, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        blurred.release()
+        sharpened.release()
+        threshold.release()
+    }
+}
+
+// OCR 전체 결과에서 한국 번호판 형식에 맞는 문자열만 골라냅니다.
 private fun findKoreanPlateCandidate(text: String): String {
     val normalized = text.replace(Regex("[^0-9가-힣]"), "")
     val plateRegex = Regex("[0-9]{2,3}[가-힣][0-9]{4}")
     return plateRegex.find(normalized)?.value.orEmpty()
 }
 
+// 휴대전화는 내부적으로 숫자 11자리만 저장하고, 화면에만 010 - 1234 - 5678 형태로 보여줍니다.
 private object PhoneNumberVisualTransformation : VisualTransformation {
     override fun filter(text: AnnotatedString): TransformedText {
         val digits = text.text.filter { it.isDigit() }.take(11)
