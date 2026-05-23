@@ -9,6 +9,8 @@ import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -21,6 +23,7 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
@@ -63,6 +66,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
@@ -79,16 +84,18 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.core.content.ContextCompat
 import com.example.vehiclelicensereportapp.ui.theme.VehicleLicenseReportAppTheme
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Size as CvSize
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import java.nio.FloatBuffer
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ExecutorService
@@ -117,7 +124,8 @@ private fun PlateReportApp() {
     var selectedViolationType by remember { mutableStateOf("") }
     var recognizedPlate by remember { mutableStateOf("") }
     var recognizedOcrText by remember { mutableStateOf("") }
-    var capturedPhotoFileName by remember { mutableStateOf("") }
+    var plateCropFilePath by remember { mutableStateOf("") }
+    var vehiclePhotoFileNames by remember { mutableStateOf("") }
     var reportContent by remember { mutableStateOf("") }
     var phoneNumberDigits by remember { mutableStateOf("") }
     var hasCameraPermission by remember {
@@ -133,7 +141,7 @@ private fun PlateReportApp() {
     }
 
     LaunchedEffect(currentScreen) {
-        if (currentScreen == AppScreen.Camera && !hasCameraPermission) {
+        if ((currentScreen == AppScreen.PlateCamera || currentScreen == AppScreen.VehicleCamera) && !hasCameraPermission) {
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
@@ -169,20 +177,26 @@ private fun PlateReportApp() {
                     onBackClick = { currentScreen = AppScreen.Category },
                     onViolationTypeSelected = { violationType ->
                         selectedViolationType = violationType
-                        currentScreen = AppScreen.Camera
+                        recognizedPlate = ""
+                        recognizedOcrText = ""
+                        plateCropFilePath = ""
+                        vehiclePhotoFileNames = ""
+                        reportContent = ""
+                        phoneNumberDigits = ""
+                        currentScreen = AppScreen.PlateCamera
                     }
                 )
 
-                AppScreen.Camera -> {
+                AppScreen.PlateCamera -> {
                     if (hasCameraPermission) {
-                        CameraOcrScreen(
+                        PlateOcrCameraScreen(
                             categoryName = selectedCategory?.name.orEmpty(),
                             violationType = selectedViolationType,
                             onBackClick = { currentScreen = AppScreen.ViolationType },
-                            onPlateRecognized = { ocrText, plate, fileName ->
+                            onPlateRecognized = { ocrText, plate, cropFilePath ->
                                 recognizedOcrText = ocrText
-                                recognizedPlate = plate
-                                capturedPhotoFileName = fileName
+                                recognizedPlate = plate.ifBlank { normalizeRecognizedPlateText(ocrText) }
+                                plateCropFilePath = cropFilePath
                                 currentScreen = AppScreen.PlateConfirm
                             }
                         )
@@ -198,14 +212,37 @@ private fun PlateReportApp() {
 
                 AppScreen.PlateConfirm -> PlateConfirmScreen(
                     plate = recognizedPlate,
+                    ocrText = recognizedOcrText,
+                    cropFilePath = plateCropFilePath,
                     onPlateChange = { recognizedPlate = it },
-                    onRetakeClick = { currentScreen = AppScreen.Camera },
-                    onNextClick = { currentScreen = AppScreen.ReportDetail }
+                    onRetakeClick = { currentScreen = AppScreen.PlateCamera },
+                    onNextClick = { currentScreen = AppScreen.VehicleCamera }
                 )
+
+                AppScreen.VehicleCamera -> {
+                    if (hasCameraPermission) {
+                        VehiclePhotoCameraScreen(
+                            categoryName = selectedCategory?.name.orEmpty(),
+                            violationType = selectedViolationType,
+                            onBackClick = { currentScreen = AppScreen.PlateConfirm },
+                            onVehiclePhotosCaptured = { fileNames ->
+                                vehiclePhotoFileNames = fileNames
+                                currentScreen = AppScreen.ReportDetail
+                            }
+                        )
+                    } else {
+                        PermissionScreen(
+                            onBackClick = { currentScreen = AppScreen.PlateConfirm },
+                            onRequestPermission = {
+                                permissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
+                        )
+                    }
+                }
 
                 AppScreen.ReportDetail -> ReportDetailScreen(
                     violationType = selectedViolationType,
-                    photoFileName = capturedPhotoFileName,
+                    photoFileName = vehiclePhotoFileNames,
                     plate = recognizedPlate,
                     content = reportContent,
                     phoneNumber = phoneNumberDigits,
@@ -232,8 +269,9 @@ private enum class AppScreen {
     Home,
     Category,
     ViolationType,
-    Camera,
+    PlateCamera,
     PlateConfirm,
+    VehicleCamera,
     ReportDetail,
     FalseReportWarning
 }
@@ -571,14 +609,14 @@ private fun PermissionScreen(
     }
 }
 
-// 카메라 프리뷰 화면입니다.
-// 중앙의 번호판 가이드 박스에 맞춰 2장을 촬영하고, 두 번째 촬영 후 OCR 결과 화면으로 이동합니다.
+// 번호판 OCR용 사진을 1장 촬영하는 카메라 화면입니다.
+// 촬영 후 OpenCV가 번호판 후보 영역을 잘라내고, 직접 학습한 OCR 결과를 확인 화면으로 넘깁니다.
 @Composable
-private fun CameraOcrScreen(
+private fun PlateOcrCameraScreen(
     categoryName: String,
     violationType: String,
     onBackClick: () -> Unit,
-    onPlateRecognized: (ocrText: String, plate: String, fileName: String) -> Unit
+    onPlateRecognized: (ocrText: String, plate: String, cropFilePath: String) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -590,12 +628,7 @@ private fun CameraOcrScreen(
     }
 
     var isProcessing by remember { mutableStateOf(false) }
-    var firstPhotoFileName by remember { mutableStateOf("") }
-    val captureMessage = if (firstPhotoFileName.isBlank()) {
-        "차량 앞 뒤 총 2장을 찍어주세요"
-    } else {
-        "한번 더찍어주세요"
-    }
+    val captureMessage = "번호판이 보이게 차량 사진을 찍어주세요"
 
     DisposableEffect(Unit) {
         onDispose {
@@ -673,13 +706,9 @@ private fun CameraOcrScreen(
                                 context = context,
                                 imageCapture = imageCapture,
                                 executor = cameraExecutor,
-                                onResult = { ocrText, plate, fileName ->
+                                onResult = { ocrText, plate, cropFilePath ->
                                     isProcessing = false
-                                    if (firstPhotoFileName.isBlank()) {
-                                        firstPhotoFileName = fileName
-                                    } else {
-                                        onPlateRecognized(ocrText, plate, "$firstPhotoFileName, $fileName")
-                                    }
+                                    onPlateRecognized(ocrText, plate, cropFilePath)
                                 },
                                 onError = { message ->
                                     isProcessing = false
@@ -726,6 +755,155 @@ private fun CameraOcrScreen(
     }
 }
 
+// 신고 증빙용 차량 사진을 앞/뒤 2장 촬영하는 카메라 화면입니다.
+// 이 단계는 OCR이 아니라 첨부사진 확보가 목적이므로 번호판 테두리 없이 전체 차량을 촬영합니다.
+@Composable
+private fun VehiclePhotoCameraScreen(
+    categoryName: String,
+    violationType: String,
+    onBackClick: () -> Unit,
+    onVehiclePhotosCaptured: (fileNames: String) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    val imageCapture = remember {
+        ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .build()
+    }
+
+    var isProcessing by remember { mutableStateOf(false) }
+    var firstPhotoFileName by remember { mutableStateOf("") }
+    val captureMessage = if (firstPhotoFileName.isBlank()) {
+        "차량 앞 뒤 총 2장을 찍어주세요"
+    } else {
+        "한번 더찍어주세요"
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            cameraExecutor.shutdown()
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { viewContext ->
+                    val previewView = PreviewView(viewContext)
+                    val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
+
+                    cameraProviderFuture.addListener(
+                        {
+                            val cameraProvider = cameraProviderFuture.get()
+                            val preview = Preview.Builder().build().also {
+                                it.setSurfaceProvider(previewView.surfaceProvider)
+                            }
+
+                            cameraProvider.unbindAll()
+                            cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                CameraSelector.DEFAULT_BACK_CAMERA,
+                                preview,
+                                imageCapture
+                            )
+                        },
+                        ContextCompat.getMainExecutor(viewContext)
+                    )
+
+                    previewView
+                }
+            )
+
+            if (isProcessing) {
+                CircularProgressIndicator(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(48.dp)
+                )
+            }
+
+            CaptureNotice(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 18.dp),
+                message = captureMessage
+            )
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 28.dp)
+                    .size(82.dp)
+                    .background(Color.White.copy(alpha = 0.32f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(Color.White, CircleShape)
+                        .border(1.dp, Color.White, CircleShape)
+                        .clickable(enabled = !isProcessing) {
+                            isProcessing = true
+                            capturePhoto(
+                                context = context,
+                                imageCapture = imageCapture,
+                                executor = cameraExecutor,
+                                prefix = "vehicle",
+                                onResult = { fileName ->
+                                    isProcessing = false
+                                    if (firstPhotoFileName.isBlank()) {
+                                        firstPhotoFileName = fileName
+                                    } else {
+                                        onVehiclePhotosCaptured("$firstPhotoFileName, $fileName")
+                                    }
+                                },
+                                onError = { message ->
+                                    isProcessing = false
+                                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                        }
+                )
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                text = "선택한 카테고리: $categoryName",
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = headingColor
+            )
+            Text(
+                text = "선택한 유형: $violationType",
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = headingColor
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            PrimaryActionButton(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isProcessing,
+                text = "이전",
+                onClick = onBackClick
+            )
+        }
+    }
+}
+
 // 카메라 화면 상단에 표시되는 흰색 안내 배너입니다.
 @Composable
 private fun CaptureNotice(
@@ -766,12 +944,12 @@ private fun CaptureNotice(
 private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
         val guideWidth = size.width * PLATE_GUIDE_WIDTH_RATIO
-        val guideHeight = size.height * PLATE_GUIDE_HEIGHT_RATIO
+        val guideHeight = size.height * PLATE_GUIDE_HEIGHT_RATIO * 1.16f
         val left = (size.width - guideWidth) / 2f
-        val top = size.height * PLATE_GUIDE_TOP_RATIO
+        val top = size.height * PLATE_GUIDE_TOP_RATIO - (size.height * PLATE_GUIDE_HEIGHT_RATIO * 0.16f)
         val right = left + guideWidth
         val bottom = top + guideHeight
-        val stroke = Stroke(width = 10.dp.toPx(), cap = StrokeCap.Round)
+        val stroke = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
         val color = Color.White
 
         drawLine(color, Offset(left, top), Offset(right, top), strokeWidth = stroke.width, cap = StrokeCap.Round)
@@ -821,15 +999,21 @@ private fun InlineWarningBanner(
 @Composable
 private fun PlateConfirmScreen(
     plate: String,
+    ocrText: String,
+    cropFilePath: String,
     onPlateChange: (String) -> Unit,
     onRetakeClick: () -> Unit,
     onNextClick: () -> Unit
 ) {
     var warningMessage by remember { mutableStateOf("") }
+    val cropBitmap = remember(cropFilePath) {
+        cropFilePath.takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(it) }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -859,6 +1043,35 @@ private fun PlateConfirmScreen(
         )
 
         Spacer(modifier = Modifier.height(24.dp))
+
+        if (cropBitmap != null) {
+            Text(
+                text = "OCR에 사용한 번호판 영역",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = bodyTextColor
+            )
+            Image(
+                bitmap = cropBitmap.asImageBitmap(),
+                contentDescription = "OCR에 사용한 번호판 crop 이미지",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(92.dp)
+                    .border(1.dp, Color(0xFFD8DDE8), RoundedCornerShape(8.dp))
+                    .padding(6.dp),
+                contentScale = ContentScale.Fit
+            )
+        }
+
+        if (ocrText.isNotBlank()) {
+            Text(
+                text = "OCR 원문: $ocrText",
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                fontWeight = FontWeight.Medium,
+                color = bodyTextColor
+            )
+        }
 
         OutlinedTextField(
             modifier = Modifier.fillMaxWidth(),
@@ -1108,9 +1321,17 @@ private fun captureAndRecognizePlate(
     context: Context,
     imageCapture: ImageCapture,
     executor: ExecutorService,
-    onResult: (ocrText: String, plate: String, fileName: String) -> Unit,
+    onResult: (ocrText: String, plate: String, cropFilePath: String) -> Unit,
     onError: (message: String) -> Unit
 ) {
+    val mainHandler = Handler(Looper.getMainLooper())
+    val postResult: (String, String, String) -> Unit = { ocrText, plate, cropFilePath ->
+        mainHandler.post { onResult(ocrText, plate, cropFilePath) }
+    }
+    val postError: (String) -> Unit = { message ->
+        mainHandler.post { onError(message) }
+    }
+
     val photoFile = File(
         context.cacheDir,
         "plate_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())}.jpg"
@@ -1127,46 +1348,138 @@ private fun captureAndRecognizePlate(
                     context = context,
                     uri = uri,
                     fileName = photoFile.name,
-                    onResult = onResult,
-                    onError = onError
+                    onResult = postResult,
+                    onError = postError
                 )
             }
 
             override fun onError(exception: ImageCaptureException) {
-                onError("사진 촬영에 실패했습니다: ${exception.message}")
+                postError("사진 촬영에 실패했습니다: ${exception.message}")
             }
         }
     )
 }
 
-// 저장된 사진에서 번호판 가이드 영역만 잘라내고 보정한 뒤 ML Kit OCR을 실행합니다.
+// OCR 없이 첨부용 사진만 저장합니다. 결과는 신고정보 확인 화면의 첨부사진 항목에 표시합니다.
+private fun capturePhoto(
+    context: Context,
+    imageCapture: ImageCapture,
+    executor: ExecutorService,
+    prefix: String,
+    onResult: (fileName: String) -> Unit,
+    onError: (message: String) -> Unit
+) {
+    val mainHandler = Handler(Looper.getMainLooper())
+    val photoFile = File(
+        context.cacheDir,
+        "${prefix}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())}.jpg"
+    )
+    val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+    imageCapture.takePicture(
+        outputOptions,
+        executor,
+        object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                mainHandler.post { onResult(photoFile.name) }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                mainHandler.post { onError("사진 촬영에 실패했습니다: ${exception.message}") }
+            }
+        }
+    )
+}
+
+// 저장된 사진에서 번호판 가이드 영역만 잘라내고 보정한 뒤 직접 학습한 ONNX OCR을 실행합니다.
 private fun recognizePlateFromImage(
     context: Context,
     uri: Uri,
     fileName: String,
-    onResult: (ocrText: String, plate: String, fileName: String) -> Unit,
+    onResult: (ocrText: String, plate: String, cropFilePath: String) -> Unit,
     onError: (message: String) -> Unit
 ) {
-    val enhancedPlateBitmap = runCatching {
+    val plateBitmaps = runCatching {
         val originalBitmap = loadOrientedBitmap(context, uri)
-        val croppedPlateBitmap = cropPlateGuideArea(originalBitmap)
-        enhancePlateBitmap(croppedPlateBitmap)
+        buildPlateBitmapCandidates(originalBitmap)
     }.getOrElse { exception ->
         onError("번호판 영역 보정에 실패했습니다: ${exception.message}")
         return
     }
 
-    val image = InputImage.fromBitmap(enhancedPlateBitmap, 0)
-    val recognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+    processPlateBitmapCandidates(
+        context = context,
+        bitmaps = plateBitmaps,
+        index = 0,
+        fileName = fileName,
+        onResult = onResult,
+        onError = onError
+    )
+}
 
-    recognizer.process(image)
-        .addOnSuccessListener { result ->
-            val ocrText = result.text
-            onResult(ocrText, findKoreanPlateCandidate(ocrText), fileName)
+// 여러 crop/전처리 후보를 모두 OCR에 넣고, 번호판 형식에 가장 가까운 결과를 선택합니다.
+private fun processPlateBitmapCandidates(
+    context: Context,
+    bitmaps: List<Bitmap>,
+    index: Int,
+    fileName: String,
+    onResult: (ocrText: String, plate: String, cropFilePath: String) -> Unit,
+    onError: (message: String) -> Unit
+) {
+    if (bitmaps.isEmpty()) {
+        onError("번호판 인식에 실패했습니다.")
+        return
+    }
+
+    var bestBitmap: Bitmap? = null
+    var bestOcrText = ""
+    var bestPlateText = ""
+    var bestScore = Int.MIN_VALUE
+    var lastFailure: Throwable? = null
+
+    bitmaps.drop(index).forEach { bitmap ->
+        runCatching {
+            PlateOcrOnnxRecognizer.recognize(context, bitmap)
+        }.onSuccess { ocrText ->
+            val plate = findKoreanPlateCandidate(ocrText)
+            if (plate.isNotBlank()) {
+                val cropFilePath = saveDebugPlateCrop(context, bitmap, fileName)
+                onResult(ocrText, plate, cropFilePath)
+                return
+            }
+
+            val normalizedText = normalizeRecognizedPlateText(ocrText)
+            val score = scoreOcrFallback(normalizedText)
+            if (normalizedText.isNotBlank() && score > bestScore) {
+                bestBitmap = bitmap
+                bestOcrText = ocrText
+                bestPlateText = normalizedText
+                bestScore = score
+            }
+        }.onFailure { exception ->
+            lastFailure = exception
         }
-        .addOnFailureListener { exception ->
-            onError("번호판 인식에 실패했습니다: ${exception.message}")
-        }
+    }
+
+    val selectedBitmap = bestBitmap
+    if (selectedBitmap != null) {
+        val cropFilePath = saveDebugPlateCrop(context, selectedBitmap, fileName)
+        onResult(bestOcrText, bestPlateText, cropFilePath)
+    } else {
+        onError("번호판 인식에 실패했습니다: ${lastFailure?.message ?: "인식된 문자가 없습니다."}")
+    }
+}
+
+// 번호판 정규식에 실패한 OCR 결과 중에서도 사용자가 수정하기 쉬운 후보를 고릅니다.
+private fun scoreOcrFallback(text: String): Int {
+    if (text.isBlank()) return Int.MIN_VALUE
+
+    var score = 0
+    if (text.any { it in '가'..'힣' }) score += 40
+    if (text.length in 7..8) score += 30
+    score += text.length.coerceAtMost(8)
+    score -= kotlin.math.abs(8 - text.length) * 2
+    return score
 }
 
 // 촬영 이미지에 저장된 EXIF 회전 정보를 읽어 실제 방향에 맞는 Bitmap으로 돌려줍니다.
@@ -1199,15 +1512,129 @@ private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
     val cropWidth = (bitmap.width * PLATE_GUIDE_WIDTH_RATIO).toInt().coerceAtLeast(1)
     val cropHeight = (bitmap.height * PLATE_GUIDE_HEIGHT_RATIO).toInt().coerceAtLeast(1)
     val left = ((bitmap.width - cropWidth) / 2).coerceIn(0, bitmap.width - 1)
-    val top = (bitmap.height * PLATE_GUIDE_TOP_RATIO).toInt().coerceIn(0, bitmap.height - 1)
+    val baseTop = (bitmap.height * PLATE_GUIDE_TOP_RATIO).toInt()
+    val topExtension = (cropHeight * 0.22f).toInt()
+    val top = (baseTop - topExtension).coerceIn(0, bitmap.height - 1)
     val safeWidth = cropWidth.coerceAtMost(bitmap.width - left)
-    val safeHeight = cropHeight.coerceAtMost(bitmap.height - top)
+    val bottom = (baseTop + cropHeight).coerceAtMost(bitmap.height)
+    val safeHeight = (bottom - top).coerceAtLeast(1)
 
     return Bitmap.createBitmap(bitmap, left, top, safeWidth, safeHeight)
 }
 
+// 전체 차량 사진에서 OpenCV로 번호판처럼 보이는 가로형 후보 영역을 찾아 OCR 후보로 만듭니다.
+private fun buildPlateBitmapCandidates(bitmap: Bitmap): List<Bitmap> {
+    val detectedCandidates = detectPlateCandidates(bitmap)
+    val fallbackCandidate = cropPlateGuideArea(bitmap)
+    val candidates = (detectedCandidates + fallbackCandidate).distinctBy { candidate ->
+        "${candidate.width}x${candidate.height}-${candidate.hashCode()}"
+    }
+
+    return candidates.flatMap { candidate ->
+        listOf(
+            candidate,
+            smoothPlateBitmap(candidate),
+            enhancePlateBitmap(candidate),
+            binarizePlateBitmap(candidate)
+        )
+    }
+}
+
+// Canny edge와 contour를 이용해 번호판 비율에 가까운 사각형 영역을 찾습니다.
+private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val blurred = Mat()
+    val edges = Mat()
+    val closed = Mat()
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(17.0, 5.0))
+    val contours = mutableListOf<MatOfPoint>()
+    val hierarchy = Mat()
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.GaussianBlur(gray, blurred, CvSize(5.0, 5.0), 0.0)
+        Imgproc.Canny(blurred, edges, 60.0, 180.0)
+        Imgproc.morphologyEx(edges, closed, Imgproc.MORPH_CLOSE, kernel)
+        Imgproc.findContours(closed, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        contours
+            .map { Imgproc.boundingRect(it) }
+            .filter { rect ->
+                val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
+                aspectRatio in 3.2f..7.5f &&
+                    rect.width > bitmap.width * 0.22f &&
+                    rect.height > bitmap.height * 0.035f &&
+                    rect.height < bitmap.height * 0.28f
+            }
+            .sortedByDescending { rect -> rect.width * rect.height }
+            .take(6)
+            .map { rect ->
+                val marginX = (rect.width * 0.08f).toInt()
+                val topMarginY = (rect.height * 0.42f).toInt()
+                val bottomMarginY = (rect.height * 0.16f).toInt()
+                val left = (rect.x - marginX).coerceAtLeast(0)
+                val top = (rect.y - topMarginY).coerceAtLeast(0)
+                val right = (rect.x + rect.width + marginX).coerceAtMost(bitmap.width)
+                val bottom = (rect.y + rect.height + bottomMarginY).coerceAtMost(bitmap.height)
+                Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+            }
+    } finally {
+        rgba.release()
+        gray.release()
+        blurred.release()
+        edges.release()
+        closed.release()
+        kernel.release()
+        hierarchy.release()
+        contours.forEach { it.release() }
+    }
+}
+
+// 실제 OCR에 넣은 번호판 crop 이미지를 캐시에 저장해 확인 화면에서 보여줍니다.
+private fun saveDebugPlateCrop(context: Context, bitmap: Bitmap, sourceFileName: String): String {
+    val debugFile = File(
+        context.cacheDir,
+        "crop_${sourceFileName.substringBeforeLast(".")}_${SimpleDateFormat("HHmmss", Locale.US).format(System.currentTimeMillis())}.jpg"
+    )
+    debugFile.outputStream().use { outputStream ->
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, outputStream)
+    }
+    return debugFile.absolutePath
+}
+
+// 화면 재촬영에서 생기는 촘촘한 줄무늬를 약하게 만들기 위해 살짝 흐림 처리합니다.
+private fun smoothPlateBitmap(bitmap: Bitmap): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val blurred = Mat()
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.GaussianBlur(gray, blurred, CvSize(3.0, 3.0), 0.0)
+
+        Bitmap.createBitmap(blurred.cols(), blurred.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(blurred, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        blurred.release()
+    }
+}
+
 // 잘라낸 번호판 이미지를 OCR이 읽기 쉽게 OpenCV로 전처리합니다.
-// 확대 -> 흑백 변환 -> 명암 보정 -> 선명화 -> 이진화 순서로 처리합니다.
+// 확대 -> 흑백 변환 -> 명암 보정 -> 선명화 순서로 처리합니다.
 private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -1216,43 +1643,170 @@ private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     val scaledBitmap = Bitmap.createScaledBitmap(bitmap, bitmap.width * 2, bitmap.height * 2, true)
     val rgba = Mat()
     val gray = Mat()
-    val blurred = Mat()
+    val denoised = Mat()
     val sharpened = Mat()
-    val threshold = Mat()
 
     return try {
         Utils.bitmapToMat(scaledBitmap, rgba)
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
         Imgproc.equalizeHist(gray, gray)
-        Imgproc.GaussianBlur(gray, blurred, CvSize(0.0, 0.0), 3.0)
-        Core.addWeighted(gray, 1.5, blurred, -0.5, 0.0, sharpened)
-        Imgproc.adaptiveThreshold(
-            sharpened,
-            threshold,
-            255.0,
-            Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
-            Imgproc.THRESH_BINARY,
-            31,
-            7.0
-        )
+        Imgproc.bilateralFilter(gray, denoised, 5, 35.0, 35.0)
+        Core.addWeighted(gray, 1.25, denoised, -0.25, 0.0, sharpened)
 
-        Bitmap.createBitmap(threshold.cols(), threshold.rows(), Bitmap.Config.ARGB_8888).also { result ->
-            Utils.matToBitmap(threshold, result)
+        Bitmap.createBitmap(sharpened.cols(), sharpened.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(sharpened, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        denoised.release()
+        sharpened.release()
+    }
+}
+
+// 글자는 검정, 배경은 흰색에 가깝게 분리해 줄무늬 배경 영향을 줄이는 후보를 만듭니다.
+private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val blurred = Mat()
+    val binary = Mat()
+    val cleaned = Mat()
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(2.0, 2.0))
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.GaussianBlur(gray, blurred, CvSize(3.0, 3.0), 0.0)
+        Imgproc.threshold(blurred, binary, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
+        Imgproc.morphologyEx(binary, cleaned, Imgproc.MORPH_OPEN, kernel)
+
+        Bitmap.createBitmap(cleaned.cols(), cleaned.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(cleaned, result)
         }
     } finally {
         rgba.release()
         gray.release()
         blurred.release()
-        sharpened.release()
-        threshold.release()
+        binary.release()
+        cleaned.release()
+        kernel.release()
     }
 }
 
 // OCR 전체 결과에서 한국 번호판 형식에 맞는 문자열만 골라냅니다.
+// assets/plate_ocr.onnx와 assets/charset.txt를 사용해 직접 학습한 번호판 OCR을 실행합니다.
+private object PlateOcrOnnxRecognizer {
+    private const val MODEL_ASSET_NAME = "plate_ocr.onnx"
+    private const val CHARSET_ASSET_NAME = "charset.txt"
+    private const val INPUT_WIDTH = 192
+    private const val INPUT_HEIGHT = 48
+    private const val BLANK_INDEX = 0
+
+    @Volatile
+    private var environment: OrtEnvironment? = null
+
+    @Volatile
+    private var session: OrtSession? = null
+
+    @Volatile
+    private var charset: List<String>? = null
+
+    fun recognize(context: Context, bitmap: Bitmap): String {
+        val appContext = context.applicationContext
+        val env = environment ?: synchronized(this) {
+            environment ?: OrtEnvironment.getEnvironment().also { environment = it }
+        }
+        val activeSession = session ?: synchronized(this) {
+            session ?: env.createSession(
+                appContext.assets.open(MODEL_ASSET_NAME).use { it.readBytes() },
+                OrtSession.SessionOptions()
+            ).also { session = it }
+        }
+        val activeCharset = charset ?: synchronized(this) {
+            charset ?: appContext.assets.open(CHARSET_ASSET_NAME).bufferedReader(Charsets.UTF_8).use { reader ->
+                reader.readText()
+                    .trim()
+                    .removePrefix("<blank>")
+                    .map { it.toString() }
+            }.also { charset = it }
+        }
+
+        val input = bitmapToModelInput(bitmap)
+        OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 1, INPUT_HEIGHT.toLong(), INPUT_WIDTH.toLong())).use { tensor ->
+            activeSession.run(mapOf(activeSession.inputNames.first() to tensor)).use { result ->
+                val logits = result[0].value as Array<Array<FloatArray>>
+                return decodeCtcGreedy(logits, activeCharset)
+            }
+        }
+    }
+
+    // 학습 코드와 같은 방식으로 비율 유지 resize, 흰색 padding, [-1, 1] 정규화를 적용합니다.
+    private fun bitmapToModelInput(bitmap: Bitmap): FloatArray {
+        val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        val scale = minOf(INPUT_WIDTH.toFloat() / source.width, INPUT_HEIGHT.toFloat() / source.height)
+        val resizedWidth = (source.width * scale).toInt().coerceAtLeast(1)
+        val resizedHeight = (source.height * scale).toInt().coerceAtLeast(1)
+        val resized = Bitmap.createScaledBitmap(source, resizedWidth, resizedHeight, true)
+        val canvasBitmap = Bitmap.createBitmap(INPUT_WIDTH, INPUT_HEIGHT, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(canvasBitmap)
+        canvas.drawColor(android.graphics.Color.WHITE)
+        canvas.drawBitmap(
+            resized,
+            ((INPUT_WIDTH - resizedWidth) / 2).toFloat(),
+            ((INPUT_HEIGHT - resizedHeight) / 2).toFloat(),
+            null
+        )
+
+        val input = FloatArray(INPUT_WIDTH * INPUT_HEIGHT)
+        var offset = 0
+        for (y in 0 until INPUT_HEIGHT) {
+            for (x in 0 until INPUT_WIDTH) {
+                val pixel = canvasBitmap.getPixel(x, y)
+                val red = android.graphics.Color.red(pixel)
+                val green = android.graphics.Color.green(pixel)
+                val blue = android.graphics.Color.blue(pixel)
+                val gray = (red * 0.299f + green * 0.587f + blue * 0.114f) / 255f
+                input[offset++] = (gray - 0.5f) / 0.5f
+            }
+        }
+        return input
+    }
+
+    // CTC 출력에서 blank와 반복 문자를 제거해 최종 번호판 문자열을 만듭니다.
+    private fun decodeCtcGreedy(logits: Array<Array<FloatArray>>, charset: List<String>): String {
+        val result = StringBuilder()
+        var previous = BLANK_INDEX
+        for (timeStep in logits.indices) {
+            val classScores = logits[timeStep][0]
+            var bestIndex = 0
+            var bestScore = classScores[0]
+            for (index in 1 until classScores.size) {
+                if (classScores[index] > bestScore) {
+                    bestScore = classScores[index]
+                    bestIndex = index
+                }
+            }
+            if (bestIndex != BLANK_INDEX && bestIndex != previous) {
+                charset.getOrNull(bestIndex - 1)?.let(result::append)
+            }
+            previous = bestIndex
+        }
+        return result.toString()
+    }
+}
+
 private fun findKoreanPlateCandidate(text: String): String {
-    val normalized = text.replace(Regex("[^0-9가-힣]"), "")
+    val normalized = normalizeRecognizedPlateText(text)
     val plateRegex = Regex("[0-9]{2,3}[가-힣][0-9]{4}")
     return plateRegex.find(normalized)?.value.orEmpty()
+}
+
+private fun normalizeRecognizedPlateText(text: String): String {
+    return text.replace(Regex("[^0-9가-힣]"), "").take(8)
 }
 
 // 휴대전화는 내부적으로 숫자 11자리만 저장하고, 화면에만 010 - 1234 - 5678 형태로 보여줍니다.
