@@ -1436,28 +1436,69 @@ private fun processPlateBitmapCandidates(
     var bestPlateText = ""
     var bestScore = Int.MIN_VALUE
     var lastFailure: Throwable? = null
+    val candidateResults = mutableListOf<OcrCandidateResult>()
 
     bitmaps.drop(index).forEach { bitmap ->
         runCatching {
             PlateOcrOnnxRecognizer.recognize(context, bitmap)
         }.onSuccess { ocrText ->
             val plate = findKoreanPlateCandidate(ocrText)
-            if (plate.isNotBlank()) {
-                val cropFilePath = saveDebugPlateCrop(context, bitmap, fileName)
-                onResult(ocrText, plate, cropFilePath)
-                return
+            val normalizedText = normalizeRecognizedPlateText(ocrText)
+            val selectedText = plate.ifBlank { normalizedText }
+            val score = scoreOcrCandidate(ocrText, normalizedText, plate)
+
+            if (isUsableOcrCandidate(selectedText, plate)) {
+                candidateResults += OcrCandidateResult(
+                    bitmap = bitmap,
+                    ocrText = ocrText,
+                    normalizedText = normalizedText,
+                    plateText = plate,
+                    score = score
+                )
             }
 
-            val normalizedText = normalizeRecognizedPlateText(ocrText)
-            val score = scoreOcrFallback(normalizedText)
-            if (normalizedText.isNotBlank() && score > bestScore) {
+            if (isUsableOcrCandidate(selectedText, plate) && score > bestScore) {
                 bestBitmap = bitmap
                 bestOcrText = ocrText
-                bestPlateText = normalizedText
+                bestPlateText = selectedText
                 bestScore = score
             }
         }.onFailure { exception ->
             lastFailure = exception
+        }
+    }
+
+    bitmaps.drop(index).take(12).forEach { bitmap ->
+        runCatching {
+            recognizePlateByCharacterSegments(context, bitmap)
+        }.onSuccess { segmentedPlate ->
+            if (segmentedPlate != null) {
+                candidateResults += OcrCandidateResult(
+                    bitmap = bitmap,
+                    ocrText = segmentedPlate,
+                    normalizedText = segmentedPlate,
+                    plateText = segmentedPlate,
+                    score = scoreOcrCandidate(segmentedPlate, segmentedPlate, segmentedPlate) + 70
+                )
+            }
+        }.onFailure { exception ->
+            lastFailure = exception
+        }
+    }
+
+    val consensusPlate = buildPlateConsensus(candidateResults.mapNotNull { result ->
+        result.plateText.takeIf { it.isNotBlank() }
+    })
+    if (consensusPlate != null) {
+        val selectedCandidate = candidateResults
+            .filter { it.plateText == consensusPlate }
+            .maxByOrNull { it.score }
+            ?: candidateResults.maxByOrNull { it.score }
+
+        if (selectedCandidate != null) {
+            val cropFilePath = saveDebugPlateCrop(context, selectedCandidate.bitmap, fileName)
+            onResult(selectedCandidate.ocrText, consensusPlate, cropFilePath)
+            return
         }
     }
 
@@ -1483,6 +1524,247 @@ private fun scoreOcrFallback(text: String): Int {
 }
 
 // 촬영 이미지에 저장된 EXIF 회전 정보를 읽어 실제 방향에 맞는 Bitmap으로 돌려줍니다.
+private data class OcrCandidateResult(
+    val bitmap: Bitmap,
+    val ocrText: String,
+    val normalizedText: String,
+    val plateText: String,
+    val score: Int
+)
+
+private fun scoreOcrCandidate(rawText: String, normalizedText: String, plateText: String): Int {
+    val text = plateText.ifBlank { normalizedText }
+    if (text.isBlank()) return Int.MIN_VALUE
+
+    var score = 0
+    if (plateText.isNotBlank()) score += 200
+    if (text.any { isKoreanPlateChar(it) }) score += 40
+    if (text.length == 8) score += 36
+    if (text.length == 7) score += 28
+    score += text.length.coerceAtMost(8)
+    score -= kotlin.math.abs(8 - text.length) * 2
+    score -= rawText.count { !it.isDigit() && !isKoreanPlateChar(it) } * 3
+    return score
+}
+
+private fun isUsableOcrCandidate(text: String, plateText: String): Boolean {
+    if (text.isBlank()) return false
+    if (plateText.isNotBlank()) return true
+    return text.count { it.isDigit() } >= 2
+}
+
+private fun buildPlateConsensus(plates: List<String>): String? {
+    if (plates.isEmpty()) return null
+
+    val targetLength = plates
+        .groupingBy { it.length }
+        .eachCount()
+        .entries
+        .sortedWith(compareByDescending<Map.Entry<Int, Int>> { it.value }.thenByDescending { it.key })
+        .first()
+        .key
+
+    val sameLengthPlates = plates.filter { it.length == targetLength }
+    if (sameLengthPlates.isEmpty()) return null
+
+    val result = StringBuilder()
+    for (index in 0 until targetLength) {
+        val candidates = sameLengthPlates.mapNotNull { plate ->
+            plate.getOrNull(index)?.takeIf { char ->
+                if (isKoreanPlatePosition(targetLength, index)) {
+                    isKoreanPlateChar(char)
+                } else {
+                    char.isDigit()
+                }
+            }
+        }
+
+        val selected = candidates
+            .groupingBy { it }
+            .eachCount()
+            .entries
+            .maxWithOrNull(compareBy<Map.Entry<Char, Int>> { it.value }.thenBy { it.key })
+            ?.key
+            ?: return null
+
+        result.append(selected)
+    }
+
+    return result.toString().takeIf { findKoreanPlateCandidate(it) == it }
+}
+
+private fun isKoreanPlatePosition(length: Int, index: Int): Boolean {
+    return (length == 7 && index == 2) || (length == 8 && index == 3)
+}
+
+private fun isKoreanPlateChar(char: Char): Boolean {
+    return char in '가'..'힣'
+}
+
+private fun recognizePlateByCharacterSegments(context: Context, bitmap: Bitmap): String? {
+    val characterBitmaps = extractCharacterBitmaps(bitmap)
+    if (characterBitmaps.size !in 7..8) return null
+
+    val result = StringBuilder()
+    characterBitmaps.forEachIndexed { index, characterBitmap ->
+        val expectedKorean = isKoreanPlatePosition(characterBitmaps.size, index)
+        val selectedChar = CharOcrOnnxRecognizer.recognize(
+            context = context,
+            bitmap = characterBitmap,
+            expectedKorean = expectedKorean
+        ) ?: return null
+
+        result.append(selectedChar)
+    }
+
+    val plate = result.toString()
+    return plate.takeIf { findKoreanPlateCandidate(it) == it }
+}
+
+private fun extractCharacterBitmaps(bitmap: Bitmap): List<Bitmap> {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val blurred = Mat()
+    val binary = Mat()
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.GaussianBlur(gray, blurred, CvSize(3.0, 3.0), 0.0)
+        Imgproc.threshold(blurred, binary, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
+
+        val runs = findCharacterColumnRuns(binary)
+        if (runs.size !in 7..8) return emptyList()
+
+        runs.map { run ->
+            val bounds = findCharacterBounds(binary, run.first, run.last)
+            Bitmap.createBitmap(
+                bitmap,
+                bounds.left,
+                bounds.top,
+                bounds.width,
+                bounds.height
+            )
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        blurred.release()
+        binary.release()
+    }
+}
+
+private data class CharacterBounds(
+    val left: Int,
+    val top: Int,
+    val width: Int,
+    val height: Int
+)
+
+private fun findCharacterColumnRuns(binary: Mat): List<IntRange> {
+    val width = binary.cols()
+    val height = binary.rows()
+    val threshold = (height * 0.10f).toInt().coerceAtLeast(2)
+    val columnCounts = IntArray(width)
+
+    for (x in 0 until width) {
+        var count = 0
+        for (y in 0 until height) {
+            if (binary.get(y, x)[0] > 0.0) count++
+        }
+        columnCounts[x] = count
+    }
+
+    val rawRuns = mutableListOf<IntRange>()
+    var start = -1
+    for (x in 0 until width) {
+        if (columnCounts[x] >= threshold) {
+            if (start == -1) start = x
+        } else if (start != -1) {
+            rawRuns += start until x
+            start = -1
+        }
+    }
+    if (start != -1) rawRuns += start until width
+
+    val mergedRuns = mergeCloseRuns(rawRuns, (width * 0.018f).toInt().coerceAtLeast(2))
+    val minWidth = (width * 0.025f).toInt().coerceAtLeast(3)
+    val maxWidth = (width * 0.24f).toInt().coerceAtLeast(minWidth + 1)
+
+    return mergedRuns
+        .filter { run -> run.count() in minWidth..maxWidth }
+        .filter { run -> runDarkPixelCount(binary, run) > height * run.count() * 0.08f }
+        .let { runs ->
+            if (runs.size <= 8) runs else runs.sortedByDescending { runDarkPixelCount(binary, it) }
+                .take(8)
+                .sortedBy { it.first }
+        }
+}
+
+private fun mergeCloseRuns(runs: List<IntRange>, maxGap: Int): List<IntRange> {
+    if (runs.isEmpty()) return emptyList()
+    val merged = mutableListOf<IntRange>()
+    var current = runs.first()
+
+    runs.drop(1).forEach { run ->
+        if (run.first - current.last <= maxGap) {
+            current = current.first..run.last
+        } else {
+            merged += current
+            current = run
+        }
+    }
+    merged += current
+    return merged
+}
+
+private fun runDarkPixelCount(binary: Mat, run: IntRange): Int {
+    var count = 0
+    for (x in run) {
+        for (y in 0 until binary.rows()) {
+            if (binary.get(y, x)[0] > 0.0) count++
+        }
+    }
+    return count
+}
+
+private fun findCharacterBounds(binary: Mat, leftRun: Int, rightRun: Int): CharacterBounds {
+    val width = binary.cols()
+    val height = binary.rows()
+    val expandedLeft = (leftRun - (width * 0.015f).toInt()).coerceAtLeast(0)
+    val expandedRight = (rightRun + (width * 0.015f).toInt()).coerceAtMost(width - 1)
+    var top = height - 1
+    var bottom = 0
+
+    for (x in expandedLeft..expandedRight) {
+        for (y in 0 until height) {
+            if (binary.get(y, x)[0] > 0.0) {
+                top = minOf(top, y)
+                bottom = maxOf(bottom, y)
+            }
+        }
+    }
+
+    if (bottom <= top) {
+        top = 0
+        bottom = height - 1
+    }
+
+    val marginY = (height * 0.08f).toInt().coerceAtLeast(2)
+    val safeTop = (top - marginY).coerceAtLeast(0)
+    val safeBottom = (bottom + marginY).coerceAtMost(height - 1)
+    return CharacterBounds(
+        left = expandedLeft,
+        top = safeTop,
+        width = (expandedRight - expandedLeft + 1).coerceAtLeast(1),
+        height = (safeBottom - safeTop + 1).coerceAtLeast(1)
+    )
+}
+
 private fun loadOrientedBitmap(context: Context, uri: Uri): Bitmap {
     val bitmap = context.contentResolver.openInputStream(uri).use { inputStream ->
         BitmapFactory.decodeStream(inputStream)
@@ -1524,9 +1806,11 @@ private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
 
 // 전체 차량 사진에서 OpenCV로 번호판처럼 보이는 가로형 후보 영역을 찾아 OCR 후보로 만듭니다.
 private fun buildPlateBitmapCandidates(bitmap: Bitmap): List<Bitmap> {
-    val detectedCandidates = detectPlateCandidates(bitmap)
-    val fallbackCandidate = cropPlateGuideArea(bitmap)
-    val candidates = (detectedCandidates + fallbackCandidate).distinctBy { candidate ->
+    val guideCandidate = cropPlateGuideArea(bitmap)
+    val guideDetectedCandidates = detectPlateCandidates(guideCandidate)
+    val candidates = (guideDetectedCandidates + guideCandidate).flatMap { candidate ->
+        listOf(candidate, cropLeftDecorationIfPresent(candidate))
+    }.distinctBy { candidate ->
         "${candidate.width}x${candidate.height}-${candidate.hashCode()}"
     }
 
@@ -1535,9 +1819,47 @@ private fun buildPlateBitmapCandidates(bitmap: Bitmap): List<Bitmap> {
             candidate,
             smoothPlateBitmap(candidate),
             enhancePlateBitmap(candidate),
-            binarizePlateBitmap(candidate)
+            binarizePlateBitmap(candidate),
+            adaptiveBinarizePlateBitmap(candidate)
         )
     }
+}
+
+private fun cropLeftDecorationIfPresent(bitmap: Bitmap): Bitmap {
+    val sampleWidth = (bitmap.width * 0.18f).toInt().coerceAtLeast(1)
+    val centerStart = (bitmap.width * 0.35f).toInt().coerceIn(0, bitmap.width - 1)
+    val centerEnd = (bitmap.width * 0.65f).toInt().coerceIn(centerStart + 1, bitmap.width)
+    var leftDark = 0
+    var centerDark = 0
+    var leftTotal = 0
+    var centerTotal = 0
+
+    for (y in 0 until bitmap.height) {
+        for (x in 0 until sampleWidth) {
+            if (pixelLuma(bitmap.getPixel(x, y)) < 95) leftDark++
+            leftTotal++
+        }
+        for (x in centerStart until centerEnd) {
+            if (pixelLuma(bitmap.getPixel(x, y)) < 95) centerDark++
+            centerTotal++
+        }
+    }
+
+    val leftDarkRatio = leftDark.toFloat() / leftTotal.coerceAtLeast(1)
+    val centerDarkRatio = centerDark.toFloat() / centerTotal.coerceAtLeast(1)
+    if (leftDarkRatio < 0.28f || leftDarkRatio < centerDarkRatio * 1.6f) {
+        return bitmap
+    }
+
+    val cropLeft = (bitmap.width * 0.16f).toInt().coerceIn(1, bitmap.width - 1)
+    return Bitmap.createBitmap(bitmap, cropLeft, 0, bitmap.width - cropLeft, bitmap.height)
+}
+
+private fun pixelLuma(pixel: Int): Int {
+    val red = android.graphics.Color.red(pixel)
+    val green = android.graphics.Color.green(pixel)
+    val blue = android.graphics.Color.blue(pixel)
+    return (red * 0.299f + green * 0.587f + blue * 0.114f).toInt()
 }
 
 // Canny edge와 contour를 이용해 번호판 비율에 가까운 사각형 영역을 찾습니다.
@@ -1567,13 +1889,17 @@ private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
             .map { Imgproc.boundingRect(it) }
             .filter { rect ->
                 val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
-                aspectRatio in 3.2f..7.5f &&
-                    rect.width > bitmap.width * 0.22f &&
-                    rect.height > bitmap.height * 0.035f &&
+                aspectRatio in 2.6f..8.4f &&
+                    rect.width > bitmap.width * 0.10f &&
+                    rect.height > bitmap.height * 0.015f &&
                     rect.height < bitmap.height * 0.28f
             }
-            .sortedByDescending { rect -> rect.width * rect.height }
-            .take(6)
+            .sortedByDescending { rect ->
+                val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
+                val aspectScore = 1000 - (kotlin.math.abs(aspectRatio - 5.2f) * 100).toInt()
+                rect.width * rect.height + aspectScore
+            }
+            .take(10)
             .map { rect ->
                 val marginX = (rect.width * 0.08f).toInt()
                 val topMarginY = (rect.height * 0.42f).toInt()
@@ -1699,6 +2025,42 @@ private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
 
 // OCR 전체 결과에서 한국 번호판 형식에 맞는 문자열만 골라냅니다.
 // assets/plate_ocr.onnx와 assets/charset.txt를 사용해 직접 학습한 번호판 OCR을 실행합니다.
+private fun adaptiveBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 珥덇린?붿뿉 ?ㅽ뙣?덉뒿?덈떎.")
+    }
+
+    val scaledBitmap = Bitmap.createScaledBitmap(bitmap, bitmap.width * 2, bitmap.height * 2, true)
+    val rgba = Mat()
+    val gray = Mat()
+    val denoised = Mat()
+    val binary = Mat()
+
+    return try {
+        Utils.bitmapToMat(scaledBitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.bilateralFilter(gray, denoised, 5, 45.0, 45.0)
+        Imgproc.adaptiveThreshold(
+            denoised,
+            binary,
+            255.0,
+            Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
+            Imgproc.THRESH_BINARY,
+            31,
+            7.0
+        )
+
+        Bitmap.createBitmap(binary.cols(), binary.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(binary, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        denoised.release()
+        binary.release()
+    }
+}
+
 private object PlateOcrOnnxRecognizer {
     private const val MODEL_ASSET_NAME = "plate_ocr.onnx"
     private const val CHARSET_ASSET_NAME = "charset.txt"
@@ -1799,14 +2161,134 @@ private object PlateOcrOnnxRecognizer {
     }
 }
 
+// 한 글자씩 분리된 이미지에는 전체 번호판 CTC 모델 대신 단일 글자 분류 모델을 사용합니다.
+// 자리 정보를 이용해 숫자 자리에서는 숫자만, 한글 자리에서는 번호판 한글만 후보로 고릅니다.
+private object CharOcrOnnxRecognizer {
+    private const val MODEL_ASSET_NAME = "char_ocr.onnx"
+    private const val CHARSET_ASSET_NAME = "char_charset.txt"
+    private const val INPUT_SIZE = 48
+
+    @Volatile
+    private var environment: OrtEnvironment? = null
+
+    @Volatile
+    private var session: OrtSession? = null
+
+    @Volatile
+    private var charset: List<Char>? = null
+
+    fun recognize(context: Context, bitmap: Bitmap, expectedKorean: Boolean): Char? {
+        val appContext = context.applicationContext
+        val env = environment ?: synchronized(this) {
+            environment ?: OrtEnvironment.getEnvironment().also { environment = it }
+        }
+        val activeSession = session ?: synchronized(this) {
+            session ?: env.createSession(
+                appContext.assets.open(MODEL_ASSET_NAME).use { it.readBytes() },
+                OrtSession.SessionOptions()
+            ).also { session = it }
+        }
+        val activeCharset = charset ?: synchronized(this) {
+            charset ?: appContext.assets.open(CHARSET_ASSET_NAME).bufferedReader(Charsets.UTF_8).use { reader ->
+                reader.readText().trim().map { it }
+            }.also { charset = it }
+        }
+
+        val input = bitmapToModelInput(bitmap)
+        OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 1, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())).use { tensor ->
+            activeSession.run(mapOf(activeSession.inputNames.first() to tensor)).use { result ->
+                val scores = readScores(result[0].value)
+                return selectBestCharacter(scores, activeCharset, expectedKorean)
+            }
+        }
+    }
+
+    // 학습용 단독 글자 이미지와 같은 48x48 흰 배경, 비율 유지, [-1, 1] 정규화 입력을 만듭니다.
+    private fun bitmapToModelInput(bitmap: Bitmap): FloatArray {
+        val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        val scale = minOf(INPUT_SIZE.toFloat() / source.width, INPUT_SIZE.toFloat() / source.height)
+        val resizedWidth = (source.width * scale).toInt().coerceAtLeast(1)
+        val resizedHeight = (source.height * scale).toInt().coerceAtLeast(1)
+        val resized = Bitmap.createScaledBitmap(source, resizedWidth, resizedHeight, true)
+        val canvasBitmap = Bitmap.createBitmap(INPUT_SIZE, INPUT_SIZE, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(canvasBitmap)
+        canvas.drawColor(android.graphics.Color.WHITE)
+        canvas.drawBitmap(
+            resized,
+            ((INPUT_SIZE - resizedWidth) / 2).toFloat(),
+            ((INPUT_SIZE - resizedHeight) / 2).toFloat(),
+            null
+        )
+
+        val input = FloatArray(INPUT_SIZE * INPUT_SIZE)
+        var offset = 0
+        for (y in 0 until INPUT_SIZE) {
+            for (x in 0 until INPUT_SIZE) {
+                val pixel = canvasBitmap.getPixel(x, y)
+                val red = android.graphics.Color.red(pixel)
+                val green = android.graphics.Color.green(pixel)
+                val blue = android.graphics.Color.blue(pixel)
+                val gray = (red * 0.299f + green * 0.587f + blue * 0.114f) / 255f
+                input[offset++] = (gray - 0.5f) / 0.5f
+            }
+        }
+        return input
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun readScores(value: Any): FloatArray {
+        return when (value) {
+            is Array<*> -> value.firstOrNull() as? FloatArray ?: FloatArray(0)
+            is FloatArray -> value
+            else -> FloatArray(0)
+        }
+    }
+
+    private fun selectBestCharacter(scores: FloatArray, charset: List<Char>, expectedKorean: Boolean): Char? {
+        var bestChar: Char? = null
+        var bestScore = Float.NEGATIVE_INFINITY
+        scores.forEachIndexed { index, score ->
+            val candidate = charset.getOrNull(index) ?: return@forEachIndexed
+            val allowed = if (expectedKorean) {
+                isKoreanPlateChar(candidate)
+            } else {
+                candidate.isDigit()
+            }
+            if (allowed && score > bestScore) {
+                bestScore = score
+                bestChar = candidate
+            }
+        }
+        return bestChar
+    }
+}
+
 private fun findKoreanPlateCandidate(text: String): String {
-    val normalized = normalizeRecognizedPlateText(text)
+    val normalized = cleanRecognizedPlateText(text)
     val plateRegex = Regex("[0-9]{2,3}[가-힣][0-9]{4}")
     return plateRegex.find(normalized)?.value.orEmpty()
 }
 
 private fun normalizeRecognizedPlateText(text: String): String {
-    return text.replace(Regex("[^0-9가-힣]"), "").take(8)
+    val cleaned = cleanRecognizedPlateText(text)
+    findKoreanPlateCandidate(cleaned).takeIf { it.isNotBlank() }?.let { return it }
+    if (cleaned.length <= 8) return cleaned
+
+    return cleaned
+        .windowed(8, 1)
+        .maxByOrNull { window ->
+            var score = 0
+            if (window.count { it.isDigit() } >= 6) score += 20
+            if (window.any { isKoreanPlateChar(it) }) score += 10
+            if (window.take(3).all { it.isDigit() }) score += 6
+            if (window.takeLast(4).all { it.isDigit() }) score += 6
+            score
+        }
+        ?: cleaned.take(8)
+}
+
+private fun cleanRecognizedPlateText(text: String): String {
+    return text.replace(Regex("[^0-9가-힣]"), "")
 }
 
 // 휴대전화는 내부적으로 숫자 11자리만 저장하고, 화면에만 010 - 1234 - 5678 형태로 보여줍니다.
