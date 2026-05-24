@@ -11,6 +11,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Rational
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -21,6 +23,8 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.ViewPort
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
@@ -92,6 +96,8 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
+import org.opencv.core.Point
+import org.opencv.core.Rect
 import org.opencv.core.Size as CvSize
 import org.opencv.imgproc.Imgproc
 import java.io.File
@@ -325,8 +331,14 @@ private val bodyTextColor = Color(0xFF6D7485)
 // 카메라 화면의 번호판 가이드 박스 비율입니다.
 // 예시 번호판처럼 가로로 길고 낮은 직사각형이 되도록 약 5:1 비율에 맞췄습니다.
 private const val PLATE_GUIDE_WIDTH_RATIO = 0.82f
-private const val PLATE_GUIDE_HEIGHT_RATIO = 0.10f
-private const val PLATE_GUIDE_TOP_RATIO = 0.42f
+private const val PLATE_GUIDE_HEIGHT_RATIO = 0.14f
+private const val PLATE_GUIDE_TOP_RATIO = 0.38f
+private const val OFFICIAL_PLATE_WIDTH_MM = 520f
+private const val OFFICIAL_PLATE_HEIGHT_MM = 110f
+private const val OFFICIAL_PLATE_ASPECT_RATIO = OFFICIAL_PLATE_WIDTH_MM / OFFICIAL_PLATE_HEIGHT_MM
+private const val OFFICIAL_PLATE_ASPECT_MIN = 2.75f
+private const val OFFICIAL_PLATE_ASPECT_MAX = 7.35f
+private val CAMERA_CAPTURE_RESOLUTION = Size(1920, 1080)
 
 // 앱 첫 화면입니다. 신고하기, 신고내역, 프로필, 도움말 버튼을 보여줍니다.
 @Composable
@@ -623,7 +635,9 @@ private fun PlateOcrCameraScreen(
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     val imageCapture = remember {
         ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setJpegQuality(100)
+            .setTargetResolution(CAMERA_CAPTURE_RESOLUTION)
             .build()
     }
 
@@ -645,23 +659,41 @@ private fun PlateOcrCameraScreen(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { viewContext ->
-                    val previewView = PreviewView(viewContext)
+                    val previewView = PreviewView(viewContext).apply {
+                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                    }
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
 
                     cameraProviderFuture.addListener(
                         {
                             val cameraProvider = cameraProviderFuture.get()
-                            val preview = Preview.Builder().build().also {
-                                it.setSurfaceProvider(previewView.surfaceProvider)
-                            }
+                            val preview = Preview.Builder()
+                                .setTargetResolution(CAMERA_CAPTURE_RESOLUTION)
+                                .build()
+                                .also {
+                                    it.setSurfaceProvider(previewView.surfaceProvider)
+                                }
 
-                            cameraProvider.unbindAll()
-                            cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
-                                CameraSelector.DEFAULT_BACK_CAMERA,
-                                preview,
-                                imageCapture
-                            )
+                            previewView.post {
+                                val viewPort = ViewPort.Builder(
+                                    Rational(previewView.width.coerceAtLeast(1), previewView.height.coerceAtLeast(1)),
+                                    previewView.display.rotation
+                                )
+                                    .setScaleType(ViewPort.FILL_CENTER)
+                                    .build()
+                                val useCaseGroup = UseCaseGroup.Builder()
+                                    .setViewPort(viewPort)
+                                    .addUseCase(preview)
+                                    .addUseCase(imageCapture)
+                                    .build()
+
+                                cameraProvider.unbindAll()
+                                cameraProvider.bindToLifecycle(
+                                    lifecycleOwner,
+                                    CameraSelector.DEFAULT_BACK_CAMERA,
+                                    useCaseGroup
+                                )
+                            }
                         },
                         ContextCompat.getMainExecutor(viewContext)
                     )
@@ -769,7 +801,9 @@ private fun VehiclePhotoCameraScreen(
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     val imageCapture = remember {
         ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setJpegQuality(100)
+            .setTargetResolution(CAMERA_CAPTURE_RESOLUTION)
             .build()
     }
 
@@ -796,23 +830,41 @@ private fun VehiclePhotoCameraScreen(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { viewContext ->
-                    val previewView = PreviewView(viewContext)
+                    val previewView = PreviewView(viewContext).apply {
+                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                    }
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
 
                     cameraProviderFuture.addListener(
                         {
                             val cameraProvider = cameraProviderFuture.get()
-                            val preview = Preview.Builder().build().also {
-                                it.setSurfaceProvider(previewView.surfaceProvider)
-                            }
+                            val preview = Preview.Builder()
+                                .setTargetResolution(CAMERA_CAPTURE_RESOLUTION)
+                                .build()
+                                .also {
+                                    it.setSurfaceProvider(previewView.surfaceProvider)
+                                }
 
-                            cameraProvider.unbindAll()
-                            cameraProvider.bindToLifecycle(
-                                lifecycleOwner,
-                                CameraSelector.DEFAULT_BACK_CAMERA,
-                                preview,
-                                imageCapture
-                            )
+                            previewView.post {
+                                val viewPort = ViewPort.Builder(
+                                    Rational(previewView.width.coerceAtLeast(1), previewView.height.coerceAtLeast(1)),
+                                    previewView.display.rotation
+                                )
+                                    .setScaleType(ViewPort.FILL_CENTER)
+                                    .build()
+                                val useCaseGroup = UseCaseGroup.Builder()
+                                    .setViewPort(viewPort)
+                                    .addUseCase(preview)
+                                    .addUseCase(imageCapture)
+                                    .build()
+
+                                cameraProvider.unbindAll()
+                                cameraProvider.bindToLifecycle(
+                                    lifecycleOwner,
+                                    CameraSelector.DEFAULT_BACK_CAMERA,
+                                    useCaseGroup
+                                )
+                            }
                         },
                         ContextCompat.getMainExecutor(viewContext)
                     )
@@ -944,9 +996,9 @@ private fun CaptureNotice(
 private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
         val guideWidth = size.width * PLATE_GUIDE_WIDTH_RATIO
-        val guideHeight = size.height * PLATE_GUIDE_HEIGHT_RATIO * 1.16f
+        val guideHeight = size.height * PLATE_GUIDE_HEIGHT_RATIO
         val left = (size.width - guideWidth) / 2f
-        val top = size.height * PLATE_GUIDE_TOP_RATIO - (size.height * PLATE_GUIDE_HEIGHT_RATIO * 0.16f)
+        val top = size.height * PLATE_GUIDE_TOP_RATIO
         val right = left + guideWidth
         val bottom = top + guideHeight
         val stroke = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
@@ -1445,7 +1497,7 @@ private fun processPlateBitmapCandidates(
             val plate = findKoreanPlateCandidate(ocrText)
             val normalizedText = normalizeRecognizedPlateText(ocrText)
             val selectedText = plate.ifBlank { normalizedText }
-            val score = scoreOcrCandidate(ocrText, normalizedText, plate)
+            val score = scoreOcrCandidate(ocrText, normalizedText, plate) - estimatePreprocessingCandidatePenalty(bitmap)
 
             if (isUsableOcrCandidate(selectedText, plate)) {
                 candidateResults += OcrCandidateResult(
@@ -1478,7 +1530,8 @@ private fun processPlateBitmapCandidates(
                     ocrText = segmentedPlate,
                     normalizedText = segmentedPlate,
                     plateText = segmentedPlate,
-                    score = scoreOcrCandidate(segmentedPlate, segmentedPlate, segmentedPlate) + 70
+                    score = scoreOcrCandidate(segmentedPlate, segmentedPlate, segmentedPlate) + 70 -
+                        estimatePreprocessingCandidatePenalty(bitmap)
                 )
             }
         }.onFailure { exception ->
@@ -1486,14 +1539,17 @@ private fun processPlateBitmapCandidates(
         }
     }
 
-    val consensusPlate = buildPlateConsensus(candidateResults.mapNotNull { result ->
-        result.plateText.takeIf { it.isNotBlank() }
-    })
+    // 정규 번호판 형식(숫자 2~3개 + 한글 1개 + 숫자 4개)이 하나라도 있으면,
+    // 한글이 없는 숫자열 fallback은 선택하지 않습니다.
+    val strictCandidates = candidateResults.filter { result ->
+        isStrictKoreanPlate(result.plateText)
+    }
+    val consensusPlate = buildPlateConsensus(strictCandidates)
     if (consensusPlate != null) {
-        val selectedCandidate = candidateResults
+        val selectedCandidate = strictCandidates
             .filter { it.plateText == consensusPlate }
             .maxByOrNull { it.score }
-            ?: candidateResults.maxByOrNull { it.score }
+            ?: strictCandidates.maxByOrNull { it.score }
 
         if (selectedCandidate != null) {
             val cropFilePath = saveDebugPlateCrop(context, selectedCandidate.bitmap, fileName)
@@ -1502,13 +1558,13 @@ private fun processPlateBitmapCandidates(
         }
     }
 
-    val selectedBitmap = bestBitmap
-    if (selectedBitmap != null) {
-        val cropFilePath = saveDebugPlateCrop(context, selectedBitmap, fileName)
-        onResult(bestOcrText, bestPlateText, cropFilePath)
-    } else {
-        onError("번호판 인식에 실패했습니다: ${lastFailure?.message ?: "인식된 문자가 없습니다."}")
+    strictCandidates.maxByOrNull { it.score }?.let { selectedCandidate ->
+        val cropFilePath = saveDebugPlateCrop(context, selectedCandidate.bitmap, fileName)
+        onResult(selectedCandidate.ocrText, selectedCandidate.plateText, cropFilePath)
+        return
     }
+
+    onError("번호판 형식으로 인식하지 못했습니다. 번호판이 선명하게 보이도록 다시 촬영해주세요.")
 }
 
 // 번호판 정규식에 실패한 OCR 결과 중에서도 사용자가 수정하기 쉬운 후보를 고릅니다.
@@ -1537,10 +1593,14 @@ private fun scoreOcrCandidate(rawText: String, normalizedText: String, plateText
     if (text.isBlank()) return Int.MIN_VALUE
 
     var score = 0
-    if (plateText.isNotBlank()) score += 200
+    if (isStrictKoreanPlate(plateText)) score += 1000
+    if (plateText.isNotBlank()) score += 220
     if (text.any { isKoreanPlateChar(it) }) score += 40
     if (text.length == 8) score += 36
     if (text.length == 7) score += 28
+    if (text.length in 7..8 && text.takeLast(4).all { it.isDigit() }) score += 45
+    if (text.length == 7 && text.take(2).all { it.isDigit() } && isKoreanPlateChar(text[2])) score += 70
+    if (text.length == 8 && text.take(3).all { it.isDigit() } && isKoreanPlateChar(text[3])) score += 70
     score += text.length.coerceAtMost(8)
     score -= kotlin.math.abs(8 - text.length) * 2
     score -= rawText.count { !it.isDigit() && !isKoreanPlateChar(it) } * 3
@@ -1553,36 +1613,125 @@ private fun isUsableOcrCandidate(text: String, plateText: String): Boolean {
     return text.count { it.isDigit() } >= 2
 }
 
-private fun buildPlateConsensus(plates: List<String>): String? {
-    if (plates.isEmpty()) return null
+private fun isStrictKoreanPlate(text: String): Boolean {
+    return Regex("^[0-9]{2,3}[가-힣][0-9]{4}$").matches(text)
+}
 
-    val targetLength = plates
-        .groupingBy { it.length }
-        .eachCount()
-        .entries
-        .sortedWith(compareByDescending<Map.Entry<Int, Int>> { it.value }.thenByDescending { it.key })
-        .first()
-        .key
+private fun estimatePreprocessingCandidatePenalty(bitmap: Bitmap): Int {
+    return estimateBinaryCandidatePenalty(bitmap) +
+        estimateSideArtifactPenalty(bitmap) +
+        estimateLeftDecorationPenalty(bitmap)
+}
 
-    val sameLengthPlates = plates.filter { it.length == targetLength }
-    if (sameLengthPlates.isEmpty()) return null
+private fun estimateBinaryCandidatePenalty(bitmap: Bitmap): Int {
+    val stepX = (bitmap.width / 96).coerceAtLeast(1)
+    val stepY = (bitmap.height / 32).coerceAtLeast(1)
+    var total = 0
+    var extreme = 0
+    var dark = 0
+
+    for (y in 0 until bitmap.height step stepY) {
+        for (x in 0 until bitmap.width step stepX) {
+            val luma = pixelLuma(bitmap.getPixel(x, y))
+            if (luma < 28 || luma > 227) extreme++
+            if (luma < 70) dark++
+            total++
+        }
+    }
+
+    if (total == 0) return 0
+    val extremeRatio = extreme.toFloat() / total
+    val darkRatio = dark.toFloat() / total
+    return when {
+        darkRatio > 0.46f -> 90
+        darkRatio > 0.36f -> 40
+        extremeRatio > 0.96f && darkRatio < 0.04f -> 35
+        else -> 0
+    }
+}
+
+private fun estimateSideArtifactPenalty(bitmap: Bitmap): Int {
+    val edgeWidth = (bitmap.width * 0.08f).toInt().coerceAtLeast(1)
+    val leftDarkRatio = estimateDarkRatio(bitmap, 0, edgeWidth)
+    val rightDarkRatio = estimateDarkRatio(bitmap, bitmap.width - edgeWidth, bitmap.width)
+    val sideDarkRatio = maxOf(leftDarkRatio, rightDarkRatio)
+
+    return when {
+        sideDarkRatio > 0.72f -> 120
+        sideDarkRatio > 0.58f -> 70
+        sideDarkRatio > 0.44f -> 35
+        else -> 0
+    }
+}
+
+private fun estimateLeftDecorationPenalty(bitmap: Bitmap): Int {
+    val leftWidth = (bitmap.width * 0.18f).toInt().coerceAtLeast(1)
+    val centerStart = (bitmap.width * 0.36f).toInt().coerceIn(0, bitmap.width - 1)
+    val centerEnd = (bitmap.width * 0.64f).toInt().coerceIn(centerStart + 1, bitmap.width)
+    val leftDarkRatio = estimateDarkRatio(bitmap, 0, leftWidth)
+    val centerDarkRatio = estimateDarkRatio(bitmap, centerStart, centerEnd)
+
+    return when {
+        leftDarkRatio > 0.34f && leftDarkRatio > centerDarkRatio * 1.45f -> 130
+        leftDarkRatio > 0.25f && leftDarkRatio > centerDarkRatio * 1.25f -> 75
+        leftDarkRatio > 0.18f && leftDarkRatio > centerDarkRatio * 1.10f -> 35
+        else -> 0
+    }
+}
+
+private fun estimateDarkRatio(bitmap: Bitmap, startX: Int, endX: Int): Float {
+    val safeStartX = startX.coerceIn(0, bitmap.width - 1)
+    val safeEndX = endX.coerceIn(safeStartX + 1, bitmap.width)
+    val stepX = ((safeEndX - safeStartX) / 16).coerceAtLeast(1)
+    val stepY = (bitmap.height / 32).coerceAtLeast(1)
+    var dark = 0
+    var total = 0
+
+    for (y in 0 until bitmap.height step stepY) {
+        for (x in safeStartX until safeEndX step stepX) {
+            if (pixelLuma(bitmap.getPixel(x, y)) < 78) dark++
+            total++
+        }
+    }
+
+    return dark.toFloat() / total.coerceAtLeast(1)
+}
+
+private fun buildPlateConsensus(results: List<OcrCandidateResult>): String? {
+    if (results.isEmpty()) return null
+
+    val minScore = results.minOf { it.score }
+    val targetLength = results
+        .groupBy { it.plateText.length }
+        .maxByOrNull { (_, sameLengthResults) ->
+            sameLengthResults.sumOf { result -> plateVoteWeight(result, minScore) }
+        }
+        ?.key
+        ?: return null
+
+    val sameLengthResults = results.filter { it.plateText.length == targetLength }
+    if (sameLengthResults.isEmpty()) return null
+
+    val groupedResults = sameLengthResults.groupBy { it.plateText }
+    val plateWeights = groupedResults.mapValues { (_, group) ->
+        group.size * 3 + group.maxOf { result -> plateVoteWeight(result, minScore) }
+    }
 
     val result = StringBuilder()
     for (index in 0 until targetLength) {
-        val candidates = sameLengthPlates.mapNotNull { plate ->
-            plate.getOrNull(index)?.takeIf { char ->
-                if (isKoreanPlatePosition(targetLength, index)) {
+        val selected = plateWeights
+            .asSequence()
+            .mapNotNull { (plate, weight) ->
+                val char = plate.getOrNull(index) ?: return@mapNotNull null
+                val allowed = if (isKoreanPlatePosition(targetLength, index)) {
                     isKoreanPlateChar(char)
                 } else {
                     char.isDigit()
                 }
+                if (allowed) char to weight else null
             }
-        }
-
-        val selected = candidates
-            .groupingBy { it }
-            .eachCount()
-            .entries
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, weights) -> weights.sum() }
             .maxWithOrNull(compareBy<Map.Entry<Char, Int>> { it.value }.thenBy { it.key })
             ?.key
             ?: return null
@@ -1590,7 +1739,36 @@ private fun buildPlateConsensus(plates: List<String>): String? {
         result.append(selected)
     }
 
-    return result.toString().takeIf { findKoreanPlateCandidate(it) == it }
+    val votedPlate = applyLastFourDigitVote(
+        basePlate = result.toString(),
+        plateWeights = plateWeights
+    )
+
+    return votedPlate.takeIf { findKoreanPlateCandidate(it) == it }
+}
+
+private fun plateVoteWeight(result: OcrCandidateResult, minScore: Int): Int {
+    val normalizedScore = (result.score - minScore).coerceAtLeast(0)
+    return (normalizedScore / 45 + 1).coerceIn(1, 18)
+}
+
+private fun applyLastFourDigitVote(
+    basePlate: String,
+    plateWeights: Map<String, Int>
+): String {
+    if (!isStrictKoreanPlate(basePlate)) return basePlate
+
+    val suffixWeights = plateWeights
+        .filterKeys { plate -> plate.length == basePlate.length && isStrictKoreanPlate(plate) }
+        .entries
+        .groupBy({ entry -> entry.key.takeLast(4) }, { entry -> entry.value })
+        .mapValues { (_, weights) -> weights.sum() }
+
+    val bestSuffix = suffixWeights.maxWithOrNull(
+        compareBy<Map.Entry<String, Int>> { it.value }.thenBy { it.key }
+    )?.key ?: return basePlate
+
+    return basePlate.dropLast(4) + bestSuffix
 }
 
 private fun isKoreanPlatePosition(length: Int, index: Int): Boolean {
@@ -1794,35 +1972,218 @@ private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
     val cropWidth = (bitmap.width * PLATE_GUIDE_WIDTH_RATIO).toInt().coerceAtLeast(1)
     val cropHeight = (bitmap.height * PLATE_GUIDE_HEIGHT_RATIO).toInt().coerceAtLeast(1)
     val left = ((bitmap.width - cropWidth) / 2).coerceIn(0, bitmap.width - 1)
-    val baseTop = (bitmap.height * PLATE_GUIDE_TOP_RATIO).toInt()
-    val topExtension = (cropHeight * 0.22f).toInt()
-    val top = (baseTop - topExtension).coerceIn(0, bitmap.height - 1)
+    val top = (bitmap.height * PLATE_GUIDE_TOP_RATIO).toInt().coerceIn(0, bitmap.height - 1)
     val safeWidth = cropWidth.coerceAtMost(bitmap.width - left)
-    val bottom = (baseTop + cropHeight).coerceAtMost(bitmap.height)
-    val safeHeight = (bottom - top).coerceAtLeast(1)
+    val safeHeight = cropHeight.coerceAtMost(bitmap.height - top).coerceAtLeast(1)
 
     return Bitmap.createBitmap(bitmap, left, top, safeWidth, safeHeight)
 }
 
 // 전체 차량 사진에서 OpenCV로 번호판처럼 보이는 가로형 후보 영역을 찾아 OCR 후보로 만듭니다.
+private fun cropBrightPlateAreaInsideGuide(bitmap: Bitmap): Bitmap {
+    if (bitmap.width <= 2 || bitmap.height <= 2) return bitmap
+
+    val brightThreshold = 135
+    val rowThreshold = (bitmap.width * 0.18f).toInt().coerceAtLeast(4)
+    val rowRuns = mutableListOf<IntRange>()
+    var rowStart = -1
+
+    for (y in 0 until bitmap.height) {
+        var brightCount = 0
+        for (x in 0 until bitmap.width) {
+            if (pixelLuma(bitmap.getPixel(x, y)) > brightThreshold) brightCount++
+        }
+
+        if (brightCount >= rowThreshold && rowStart == -1) {
+            rowStart = y
+        } else if (brightCount < rowThreshold && rowStart != -1) {
+            rowRuns += rowStart until y
+            rowStart = -1
+        }
+    }
+    if (rowStart != -1) rowRuns += rowStart until bitmap.height
+
+    val plateRowRun = rowRuns
+        .filter { run -> run.count() >= bitmap.height * 0.18f }
+        .maxByOrNull { run -> run.count() }
+        ?: return bitmap
+
+    val yMargin = (plateRowRun.count() * 0.12f).toInt().coerceAtLeast(2)
+    val top = (plateRowRun.first - yMargin).coerceAtLeast(0)
+    val bottom = (plateRowRun.last + yMargin).coerceAtMost(bitmap.height - 1)
+    val bandHeight = (bottom - top + 1).coerceAtLeast(1)
+    val columnThreshold = (bandHeight * 0.18f).toInt().coerceAtLeast(3)
+    val rawColumnRuns = mutableListOf<IntRange>()
+    var columnStart = -1
+
+    for (x in 0 until bitmap.width) {
+        var brightCount = 0
+        for (y in top..bottom) {
+            if (pixelLuma(bitmap.getPixel(x, y)) > brightThreshold) brightCount++
+        }
+
+        if (brightCount >= columnThreshold && columnStart == -1) {
+            columnStart = x
+        } else if (brightCount < columnThreshold && columnStart != -1) {
+            rawColumnRuns += columnStart until x
+            columnStart = -1
+        }
+    }
+    if (columnStart != -1) rawColumnRuns += columnStart until bitmap.width
+
+    val mergedColumnRuns = mergeCloseRuns(rawColumnRuns, (bitmap.width * 0.025f).toInt().coerceAtLeast(3))
+    val plateColumnRun = mergedColumnRuns
+        .filter { run -> run.count() >= bitmap.width * 0.28f }
+        .maxByOrNull { run -> run.count() }
+        ?: return bitmap
+
+    val xMargin = (plateColumnRun.count() * 0.035f).toInt().coerceAtLeast(3)
+    val left = (plateColumnRun.first - xMargin).coerceAtLeast(0)
+    val right = (plateColumnRun.last + xMargin).coerceAtMost(bitmap.width - 1)
+    val cropWidth = right - left + 1
+    val cropHeight = bottom - top + 1
+    val aspectRatio = cropWidth.toFloat() / cropHeight.coerceAtLeast(1)
+
+    if (aspectRatio !in OFFICIAL_PLATE_ASPECT_MIN..OFFICIAL_PLATE_ASPECT_MAX) return bitmap
+    return Bitmap.createBitmap(bitmap, left, top, cropWidth, cropHeight)
+}
+
+private fun detectPlateAreaCandidatesInsideGuide(bitmap: Bitmap): List<Bitmap> {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val contrast = Mat()
+    val blurred = Mat()
+    val binary = Mat()
+    val closed = Mat()
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(23.0, 5.0))
+    val contours = mutableListOf<MatOfPoint>()
+    val hierarchy = Mat()
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        gray.convertTo(contrast, -1, 1.7, -38.0)
+        Imgproc.GaussianBlur(contrast, blurred, CvSize(3.0, 3.0), 0.0)
+        Imgproc.threshold(blurred, binary, 0.0, 255.0, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU)
+        Imgproc.morphologyEx(binary, closed, Imgproc.MORPH_CLOSE, kernel)
+        Imgproc.findContours(closed, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        contours
+            .map { Imgproc.boundingRect(it) }
+            .filter { rect ->
+                val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
+                val widthRatio = rect.width.toFloat() / bitmap.width.coerceAtLeast(1)
+                val heightRatio = rect.height.toFloat() / bitmap.height.coerceAtLeast(1)
+                aspectRatio in OFFICIAL_PLATE_ASPECT_MIN..OFFICIAL_PLATE_ASPECT_MAX &&
+                    widthRatio in 0.34f..0.98f &&
+                    heightRatio in 0.22f..0.95f
+            }
+            .sortedByDescending { rect ->
+                val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
+                val centerX = rect.x + rect.width / 2f
+                val centerY = rect.y + rect.height / 2f
+                val centerPenalty = kotlin.math.abs(centerX - bitmap.width / 2f) +
+                    kotlin.math.abs(centerY - bitmap.height / 2f) * 0.6f
+                rect.width * rect.height -
+                    officialPlateAspectPenalty(aspectRatio, 210f) -
+                    centerPenalty.toInt()
+            }
+            .take(4)
+            .mapNotNull { rect ->
+                cropExpandedRect(bitmap, rect, 0.035f, 0.18f)
+            }
+    } finally {
+        rgba.release()
+        gray.release()
+        contrast.release()
+        blurred.release()
+        binary.release()
+        closed.release()
+        kernel.release()
+        hierarchy.release()
+        contours.forEach { it.release() }
+    }
+}
+
+private fun cropExpandedRect(bitmap: Bitmap, rect: Rect, marginXRatio: Float, marginYRatio: Float): Bitmap? {
+    val marginX = (rect.width * marginXRatio).toInt().coerceAtLeast(2)
+    val marginY = (rect.height * marginYRatio).toInt().coerceAtLeast(2)
+    val left = (rect.x - marginX).coerceAtLeast(0)
+    val top = (rect.y - marginY).coerceAtLeast(0)
+    val right = (rect.x + rect.width + marginX).coerceAtMost(bitmap.width)
+    val bottom = (rect.y + rect.height + marginY).coerceAtMost(bitmap.height)
+    val width = right - left
+    val height = bottom - top
+    if (width <= 1 || height <= 1) return null
+    return Bitmap.createBitmap(bitmap, left, top, width, height)
+}
+
+private fun officialPlateAspectPenalty(aspectRatio: Float, scale: Float): Int {
+    return (kotlin.math.abs(aspectRatio - OFFICIAL_PLATE_ASPECT_RATIO) * scale).toInt()
+}
+
 private fun buildPlateBitmapCandidates(bitmap: Bitmap): List<Bitmap> {
     val guideCandidate = cropPlateGuideArea(bitmap)
-    val guideDetectedCandidates = detectPlateCandidates(guideCandidate)
-    val candidates = (guideDetectedCandidates + guideCandidate).flatMap { candidate ->
-        listOf(candidate, cropLeftDecorationIfPresent(candidate))
+    val characterGroupCandidates = detectPlateCandidatesByCharacterGroups(guideCandidate)
+    val detectedPlateCandidates = detectPlateAreaCandidatesInsideGuide(guideCandidate)
+    val brightPlateCandidate = cropBrightPlateAreaInsideGuide(guideCandidate)
+    val baseCandidates = (characterGroupCandidates + detectedPlateCandidates + brightPlateCandidate + guideCandidate)
+        .distinctBy { candidate ->
+            "${candidate.width}x${candidate.height}-${candidate.hashCode()}"
+        }
+    val candidates = baseCandidates.flatMap { candidate ->
+        buildPlateCropVariants(candidate)
     }.distinctBy { candidate ->
         "${candidate.width}x${candidate.height}-${candidate.hashCode()}"
     }
 
-    return candidates.flatMap { candidate ->
+    return candidates.map { candidate ->
+        normalizePlateResolution(candidate)
+    }.flatMap { candidate ->
         listOf(
             candidate,
-            smoothPlateBitmap(candidate),
-            enhancePlateBitmap(candidate),
+            strongBinarizePlateBitmap(candidate),
+            boldBinarizePlateBitmap(candidate, 1),
+            boldBinarizePlateBitmap(candidate, 2),
             binarizePlateBitmap(candidate),
             adaptiveBinarizePlateBitmap(candidate)
         )
+    }.distinctBy { candidate ->
+        "${candidate.width}x${candidate.height}-${candidate.hashCode()}"
     }
+}
+
+private const val NORMALIZED_PLATE_WIDTH = 768
+private const val NORMALIZED_PLATE_HEIGHT = 192
+
+// 모든 OCR 후보를 같은 해상도 캔버스에 맞춰 후속 전처리와 화면 확인 결과가 흔들리지 않게 합니다.
+private fun normalizePlateResolution(bitmap: Bitmap): Bitmap {
+    val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+    val scale = minOf(
+        NORMALIZED_PLATE_WIDTH.toFloat() / source.width.coerceAtLeast(1),
+        NORMALIZED_PLATE_HEIGHT.toFloat() / source.height.coerceAtLeast(1)
+    )
+    val resizedWidth = (source.width * scale).toInt().coerceAtLeast(1)
+    val resizedHeight = (source.height * scale).toInt().coerceAtLeast(1)
+    val resized = Bitmap.createScaledBitmap(source, resizedWidth, resizedHeight, true)
+    val canvasBitmap = Bitmap.createBitmap(
+        NORMALIZED_PLATE_WIDTH,
+        NORMALIZED_PLATE_HEIGHT,
+        Bitmap.Config.ARGB_8888
+    )
+    val canvas = android.graphics.Canvas(canvasBitmap)
+    canvas.drawColor(android.graphics.Color.WHITE)
+    canvas.drawBitmap(
+        resized,
+        ((NORMALIZED_PLATE_WIDTH - resizedWidth) / 2).toFloat(),
+        ((NORMALIZED_PLATE_HEIGHT - resizedHeight) / 2).toFloat(),
+        null
+    )
+    return canvasBitmap
 }
 
 private fun cropLeftDecorationIfPresent(bitmap: Bitmap): Bitmap {
@@ -1855,6 +2216,67 @@ private fun cropLeftDecorationIfPresent(bitmap: Bitmap): Bitmap {
     return Bitmap.createBitmap(bitmap, cropLeft, 0, bitmap.width - cropLeft, bitmap.height)
 }
 
+private fun buildPlateCropVariants(bitmap: Bitmap): List<Bitmap> {
+    val sideTrimmed = trimPlateSideBars(bitmap)
+    val variants = mutableListOf<Bitmap>()
+
+    variants += bitmap
+    variants += sideTrimmed
+    variants += cropLeftDecorationIfPresent(bitmap)
+    variants += cropLeftDecorationIfPresent(sideTrimmed)
+
+    return variants.filter { candidate ->
+        candidate.width > candidate.height * 2 && candidate.width > 80 && candidate.height > 20
+    }.distinctBy { candidate ->
+        "${candidate.width}x${candidate.height}-${candidate.hashCode()}"
+    }
+}
+
+private fun cropLeftRatio(bitmap: Bitmap, ratio: Float): Bitmap {
+    if (bitmap.width <= 2) return bitmap
+
+    val cropLeft = (bitmap.width * ratio).toInt().coerceIn(1, bitmap.width - 1)
+    val cropWidth = bitmap.width - cropLeft
+    if (cropWidth < bitmap.height * 2) return bitmap
+
+    return Bitmap.createBitmap(bitmap, cropLeft, 0, cropWidth, bitmap.height)
+}
+
+private fun trimPlateSideBars(bitmap: Bitmap): Bitmap {
+    if (bitmap.width <= 2 || bitmap.height <= 2) return bitmap
+
+    val maxTrim = (bitmap.width * 0.24f).toInt().coerceAtLeast(1)
+    var left = 0
+    while (left < maxTrim && estimateColumnDarkRatio(bitmap, left) > 0.68f) {
+        left++
+    }
+
+    var right = bitmap.width - 1
+    while (bitmap.width - 1 - right < maxTrim && estimateColumnDarkRatio(bitmap, right) > 0.68f) {
+        right--
+    }
+
+    val cropWidth = right - left + 1
+    if (left == 0 && right == bitmap.width - 1) return bitmap
+    if (cropWidth < bitmap.width * 0.56f || cropWidth < bitmap.height * 2) return bitmap
+
+    return Bitmap.createBitmap(bitmap, left, 0, cropWidth, bitmap.height)
+}
+
+private fun estimateColumnDarkRatio(bitmap: Bitmap, x: Int): Float {
+    val safeX = x.coerceIn(0, bitmap.width - 1)
+    val stepY = (bitmap.height / 48).coerceAtLeast(1)
+    var dark = 0
+    var total = 0
+
+    for (y in 0 until bitmap.height step stepY) {
+        if (pixelLuma(bitmap.getPixel(safeX, y)) < 80) dark++
+        total++
+    }
+
+    return dark.toFloat() / total.coerceAtLeast(1)
+}
+
 private fun pixelLuma(pixel: Int): Int {
     val red = android.graphics.Color.red(pixel)
     val green = android.graphics.Color.green(pixel)
@@ -1862,7 +2284,302 @@ private fun pixelLuma(pixel: Int): Int {
     return (red * 0.299f + green * 0.587f + blue * 0.114f).toInt()
 }
 
+private data class CharacterContour(
+    val rect: Rect,
+    val centerX: Double,
+    val centerY: Double,
+    val area: Double
+)
+
+private data class CharacterGroup(
+    val contours: List<CharacterContour>,
+    val bounds: Rect,
+    val angleDegrees: Double,
+    val score: Double
+)
+
+// 번호판 외곽선보다 글자 contour 묶음을 먼저 찾고, 그 묶음을 기준으로 번호판 crop을 정교화합니다.
+private fun detectPlateCandidatesByCharacterGroups(bitmap: Bitmap): List<Bitmap> {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val blurred = Mat()
+    val binary = Mat()
+    val cleaned = Mat()
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(2.0, 2.0))
+    val contours = mutableListOf<MatOfPoint>()
+    val hierarchy = Mat()
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.GaussianBlur(gray, blurred, CvSize(3.0, 3.0), 0.0)
+        Imgproc.adaptiveThreshold(
+            blurred,
+            binary,
+            255.0,
+            Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
+            Imgproc.THRESH_BINARY_INV,
+            31,
+            9.0
+        )
+        Imgproc.morphologyEx(binary, cleaned, Imgproc.MORPH_OPEN, kernel)
+        Imgproc.findContours(cleaned, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+        val characterContours = contours
+            .map { Imgproc.boundingRect(it) }
+            .mapNotNull { rect -> rect.toCharacterContour(bitmap.width, bitmap.height) }
+            .sortedBy { it.centerX }
+
+        buildCharacterGroups(characterContours, bitmap.width, bitmap.height)
+            .take(5)
+            .flatMap { group ->
+                val officialCrop = cropOfficialPlateRatioCharacterGroupCandidate(bitmap, group, includeLeftDecoration = false)
+                val officialLeftCrop = cropOfficialPlateRatioCharacterGroupCandidate(bitmap, group, includeLeftDecoration = true)
+                val refinedCrop = cropCharacterGroupCandidate(bitmap, group)
+                val deskewedCrop = cropDeskewedCharacterGroupCandidate(bitmap, group)
+                listOfNotNull(officialCrop, officialLeftCrop, deskewedCrop, refinedCrop)
+            }
+    } finally {
+        rgba.release()
+        gray.release()
+        blurred.release()
+        binary.release()
+        cleaned.release()
+        kernel.release()
+        hierarchy.release()
+        contours.forEach { it.release() }
+    }
+}
+
+private fun Rect.toCharacterContour(imageWidth: Int, imageHeight: Int): CharacterContour? {
+    if (width <= 0 || height <= 0) return null
+
+    val aspectRatio = width.toFloat() / height
+    val area = width.toDouble() * height.toDouble()
+    val imageArea = imageWidth.toDouble() * imageHeight.toDouble()
+    val heightRatio = height.toFloat() / imageHeight.coerceAtLeast(1)
+    val widthRatio = width.toFloat() / imageWidth.coerceAtLeast(1)
+
+    if (heightRatio !in 0.16f..0.88f) return null
+    if (widthRatio !in 0.006f..0.22f) return null
+    if (aspectRatio !in 0.08f..1.35f) return null
+    if (area < imageArea * 0.0004 || area > imageArea * 0.12) return null
+
+    return CharacterContour(
+        rect = this,
+        centerX = x + width / 2.0,
+        centerY = y + height / 2.0,
+        area = area
+    )
+}
+
+private fun buildCharacterGroups(
+    contours: List<CharacterContour>,
+    imageWidth: Int,
+    imageHeight: Int
+): List<CharacterGroup> {
+    if (contours.size < 6) return emptyList()
+
+    val groups = mutableListOf<CharacterGroup>()
+    contours.forEach { base ->
+        val matched = contours
+            .filter { candidate ->
+                val heightDiff = kotlin.math.abs(candidate.rect.height - base.rect.height).toDouble() /
+                    maxOf(candidate.rect.height, base.rect.height).coerceAtLeast(1)
+                val centerYDiff = kotlin.math.abs(candidate.centerY - base.centerY)
+                val areaDiff = kotlin.math.abs(candidate.area - base.area) / maxOf(candidate.area, base.area)
+
+                heightDiff <= 0.55 &&
+                    centerYDiff <= maxOf(candidate.rect.height, base.rect.height) * 0.75 &&
+                    areaDiff <= 0.82
+            }
+            .sortedBy { it.centerX }
+
+        splitCharacterRuns(matched, imageWidth).forEach { run ->
+            buildCharacterGroup(run, imageWidth, imageHeight)?.let(groups::add)
+        }
+    }
+
+    return groups
+        .distinctBy { group ->
+            "${group.bounds.x / 8}-${group.bounds.y / 8}-${group.bounds.width / 8}-${group.bounds.height / 8}"
+        }
+        .sortedByDescending { it.score }
+}
+
+private fun splitCharacterRuns(contours: List<CharacterContour>, imageWidth: Int): List<List<CharacterContour>> {
+    if (contours.isEmpty()) return emptyList()
+
+    val runs = mutableListOf<MutableList<CharacterContour>>()
+    var current = mutableListOf(contours.first())
+
+    contours.drop(1).forEach { contour ->
+        val previous = current.last()
+        val gap = contour.rect.x - (previous.rect.x + previous.rect.width)
+        val averageHeight = current.map { it.rect.height }.average().takeIf { !it.isNaN() } ?: previous.rect.height.toDouble()
+        val maxGap = maxOf(8.0, averageHeight * 1.45, imageWidth * 0.035)
+
+        if (gap <= maxGap) {
+            current += contour
+        } else {
+            runs += current
+            current = mutableListOf(contour)
+        }
+    }
+    runs += current
+
+    return runs
+}
+
+private fun buildCharacterGroup(
+    contours: List<CharacterContour>,
+    imageWidth: Int,
+    imageHeight: Int
+): CharacterGroup? {
+    if (contours.size !in 6..9) return null
+
+    val left = contours.minOf { it.rect.x }
+    val top = contours.minOf { it.rect.y }
+    val right = contours.maxOf { it.rect.x + it.rect.width }
+    val bottom = contours.maxOf { it.rect.y + it.rect.height }
+    val width = (right - left).coerceAtLeast(1)
+    val height = (bottom - top).coerceAtLeast(1)
+    val aspectRatio = width.toFloat() / height
+    if (aspectRatio !in 2.2f..7.4f) return null
+    if (width < imageWidth * 0.28f || height < imageHeight * 0.12f) return null
+
+    val sorted = contours.sortedBy { it.centerX }
+    val angle = estimateCharacterGroupAngle(sorted)
+    if (kotlin.math.abs(angle) > 18.0) return null
+
+    val averageHeight = sorted.map { it.rect.height }.average()
+    val ySpread = sorted.maxOf { it.centerY } - sorted.minOf { it.centerY }
+    val countScore = when (sorted.size) {
+        7, 8 -> 180.0
+        6, 9 -> 55.0
+        else -> 0.0
+    }
+    val aspectScore = 120.0 - kotlin.math.abs(aspectRatio - OFFICIAL_PLATE_ASPECT_RATIO) * 18.0
+    val alignmentScore = 70.0 - (ySpread / averageHeight.coerceAtLeast(1.0)) * 35.0
+    val sizeScore = (width.toDouble() * height.toDouble()) / (imageWidth.toDouble() * imageHeight.toDouble()) * 180.0
+
+    return CharacterGroup(
+        contours = sorted,
+        bounds = Rect(left, top, width, height),
+        angleDegrees = angle,
+        score = countScore + aspectScore + alignmentScore + sizeScore
+    )
+}
+
+private fun estimateCharacterGroupAngle(contours: List<CharacterContour>): Double {
+    if (contours.size < 2) return 0.0
+    val first = contours.first()
+    val last = contours.last()
+    val dx = (last.centerX - first.centerX).takeIf { kotlin.math.abs(it) > 0.001 } ?: return 0.0
+    val dy = last.centerY - first.centerY
+    return Math.toDegrees(kotlin.math.atan2(dy, dx))
+}
+
+private fun cropCharacterGroupCandidate(bitmap: Bitmap, group: CharacterGroup): Bitmap? {
+    val rect = expandCharacterGroupBounds(group.bounds, bitmap.width, bitmap.height)
+    if (rect.width <= 1 || rect.height <= 1) return null
+    return Bitmap.createBitmap(bitmap, rect.x, rect.y, rect.width, rect.height)
+}
+
+private fun cropOfficialPlateRatioCharacterGroupCandidate(
+    bitmap: Bitmap,
+    group: CharacterGroup,
+    includeLeftDecoration: Boolean
+): Bitmap? {
+    val rect = expandCharacterGroupBoundsToOfficialPlateRatio(
+        bounds = group.bounds,
+        imageWidth = bitmap.width,
+        imageHeight = bitmap.height,
+        includeLeftDecoration = includeLeftDecoration
+    )
+    if (rect.width <= 1 || rect.height <= 1) return null
+    return Bitmap.createBitmap(bitmap, rect.x, rect.y, rect.width, rect.height)
+}
+
+private fun cropDeskewedCharacterGroupCandidate(bitmap: Bitmap, group: CharacterGroup): Bitmap? {
+    if (kotlin.math.abs(group.angleDegrees) < 1.0) return null
+
+    val rgba = Mat()
+    val rotated = Mat()
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        val center = Point(group.bounds.x + group.bounds.width / 2.0, group.bounds.y + group.bounds.height / 2.0)
+        val rotationMatrix = Imgproc.getRotationMatrix2D(center, group.angleDegrees, 1.0)
+        Imgproc.warpAffine(rgba, rotated, rotationMatrix, rgba.size())
+
+        val rect = expandCharacterGroupBounds(group.bounds, bitmap.width, bitmap.height)
+        val safeRect = Rect(
+            rect.x.coerceIn(0, rotated.cols() - 1),
+            rect.y.coerceIn(0, rotated.rows() - 1),
+            rect.width.coerceAtMost(rotated.cols() - rect.x).coerceAtLeast(1),
+            rect.height.coerceAtMost(rotated.rows() - rect.y).coerceAtLeast(1)
+        )
+        val cropMat = Mat(rotated, safeRect)
+        Bitmap.createBitmap(cropMat.cols(), cropMat.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(cropMat, result)
+            cropMat.release()
+        }
+    } catch (_: Throwable) {
+        null
+    } finally {
+        rgba.release()
+        rotated.release()
+    }
+}
+
+private fun expandCharacterGroupBounds(bounds: Rect, imageWidth: Int, imageHeight: Int): Rect {
+    val marginX = (bounds.width * 0.18f).toInt().coerceAtLeast(8)
+    val topMargin = (bounds.height * 0.45f).toInt().coerceAtLeast(8)
+    val bottomMargin = (bounds.height * 0.28f).toInt().coerceAtLeast(6)
+    val left = (bounds.x - marginX).coerceAtLeast(0)
+    val top = (bounds.y - topMargin).coerceAtLeast(0)
+    val right = (bounds.x + bounds.width + marginX).coerceAtMost(imageWidth)
+    val bottom = (bounds.y + bounds.height + bottomMargin).coerceAtMost(imageHeight)
+    return Rect(left, top, (right - left).coerceAtLeast(1), (bottom - top).coerceAtLeast(1))
+}
+
 // Canny edge와 contour를 이용해 번호판 비율에 가까운 사각형 영역을 찾습니다.
+// Expands a detected 7/8-character run back to the official 520x110 plate ratio.
+private fun expandCharacterGroupBoundsToOfficialPlateRatio(
+    bounds: Rect,
+    imageWidth: Int,
+    imageHeight: Int,
+    includeLeftDecoration: Boolean
+): Rect {
+    val minimumWidthFromChars = bounds.width * if (includeLeftDecoration) 1.22f else 1.14f
+    val minimumHeightFromChars = bounds.height * 1.24f
+    var targetWidth = maxOf(
+        minimumWidthFromChars,
+        (bounds.height / 0.74f) * OFFICIAL_PLATE_ASPECT_RATIO
+    )
+    var targetHeight = targetWidth / OFFICIAL_PLATE_ASPECT_RATIO
+
+    if (targetHeight < minimumHeightFromChars) {
+        targetHeight = minimumHeightFromChars
+        targetWidth = targetHeight * OFFICIAL_PLATE_ASPECT_RATIO
+    }
+
+    val centerXOffset = if (includeLeftDecoration) -targetWidth * 0.035f else 0f
+    val centerX = bounds.x + bounds.width / 2f + centerXOffset
+    val centerY = bounds.y + bounds.height / 2f
+    val targetWidthInt = targetWidth.toInt().coerceAtLeast(bounds.width + 2).coerceAtMost(imageWidth)
+    val targetHeightInt = targetHeight.toInt().coerceAtLeast(bounds.height + 2).coerceAtMost(imageHeight)
+    val left = (centerX - targetWidthInt / 2f).toInt().coerceIn(0, (imageWidth - targetWidthInt).coerceAtLeast(0))
+    val top = (centerY - targetHeightInt / 2f).toInt().coerceIn(0, (imageHeight - targetHeightInt).coerceAtLeast(0))
+
+    return Rect(left, top, targetWidthInt, targetHeightInt)
+}
+
+// Finds wide plate-like rectangles with Canny edges as a fallback candidate source.
 private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -1889,14 +2606,14 @@ private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
             .map { Imgproc.boundingRect(it) }
             .filter { rect ->
                 val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
-                aspectRatio in 2.6f..8.4f &&
+                aspectRatio in OFFICIAL_PLATE_ASPECT_MIN..OFFICIAL_PLATE_ASPECT_MAX &&
                     rect.width > bitmap.width * 0.10f &&
                     rect.height > bitmap.height * 0.015f &&
                     rect.height < bitmap.height * 0.28f
             }
             .sortedByDescending { rect ->
                 val aspectRatio = rect.width.toFloat() / rect.height.coerceAtLeast(1)
-                val aspectScore = 1000 - (kotlin.math.abs(aspectRatio - 5.2f) * 100).toInt()
+                val aspectScore = 1000 - officialPlateAspectPenalty(aspectRatio, 120f)
                 rect.width * rect.height + aspectScore
             }
             .take(10)
@@ -1959,25 +2676,121 @@ private fun smoothPlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 잘라낸 번호판 이미지를 OCR이 읽기 쉽게 OpenCV로 전처리합니다.
-// 확대 -> 흑백 변환 -> 명암 보정 -> 선명화 순서로 처리합니다.
-private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
+// 글자 획을 깨뜨리지 않는 선에서 회색조, 대비 보정, 노이즈 완화, 선명화를 적용합니다.
+// 강한 이진화보다 먼저 OCR 후보에 넣어 한글 획 손상을 줄입니다.
+private fun strongBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
     }
 
-    val scaledBitmap = Bitmap.createScaledBitmap(bitmap, bitmap.width * 2, bitmap.height * 2, true)
     val rgba = Mat()
     val gray = Mat()
+    val contrast = Mat()
+    val blurred = Mat()
+    val sharpened = Mat()
+    val binary = Mat()
+    val cleaned = Mat()
+    val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(2.0, 2.0))
+    val openKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(1.0, 1.0))
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        gray.convertTo(contrast, -1, 2.15, -82.0)
+        Imgproc.GaussianBlur(contrast, blurred, CvSize(0.0, 0.0), 0.8)
+        Core.addWeighted(contrast, 1.7, blurred, -0.7, 0.0, sharpened)
+        Imgproc.threshold(sharpened, binary, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
+        Imgproc.morphologyEx(binary, cleaned, Imgproc.MORPH_CLOSE, closeKernel)
+        Imgproc.morphologyEx(cleaned, cleaned, Imgproc.MORPH_OPEN, openKernel)
+
+        Bitmap.createBitmap(cleaned.cols(), cleaned.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(cleaned, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        contrast.release()
+        blurred.release()
+        sharpened.release()
+        binary.release()
+        cleaned.release()
+        closeKernel.release()
+        openKernel.release()
+    }
+}
+
+// 획이 얇게 나온 번호판을 위해 검은 글자를 1~2픽셀 정도 더 두껍게 만든 OCR 후보를 만듭니다.
+// 흰 배경은 유지하고 검은 글자만 키워서 2/3/5/6/8처럼 헷갈리는 숫자의 특징을 더 분명하게 합니다.
+private fun boldBinarizePlateBitmap(bitmap: Bitmap, iterations: Int): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val contrast = Mat()
+    val blurred = Mat()
+    val sharpened = Mat()
+    val binary = Mat()
+    val thickened = Mat()
+    val cleaned = Mat()
+    val strokeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(2.0, 2.0))
+    val cleanKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(1.0, 1.0))
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        gray.convertTo(contrast, -1, 2.35, -92.0)
+        Imgproc.GaussianBlur(contrast, blurred, CvSize(0.0, 0.0), 0.65)
+        Core.addWeighted(contrast, 1.85, blurred, -0.85, 0.0, sharpened)
+        Imgproc.threshold(sharpened, binary, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
+
+        // OpenCV의 erode는 흰 영역을 줄이므로, 흰 배경/검은 글자 이미지에서는 검은 획이 두꺼워집니다.
+        Imgproc.erode(
+            binary,
+            thickened,
+            strokeKernel,
+            Point(-1.0, -1.0),
+            iterations.coerceIn(1, 2)
+        )
+        Imgproc.morphologyEx(thickened, cleaned, Imgproc.MORPH_OPEN, cleanKernel)
+
+        Bitmap.createBitmap(cleaned.cols(), cleaned.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(cleaned, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        contrast.release()
+        blurred.release()
+        sharpened.release()
+        binary.release()
+        thickened.release()
+        cleaned.release()
+        strokeKernel.release()
+        cleanKernel.release()
+    }
+}
+
+private fun enhanceReadablePlateBitmap(bitmap: Bitmap): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val contrast = Mat()
     val denoised = Mat()
+    val blurred = Mat()
     val sharpened = Mat()
 
     return try {
-        Utils.bitmapToMat(scaledBitmap, rgba)
+        Utils.bitmapToMat(bitmap, rgba)
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
-        Imgproc.equalizeHist(gray, gray)
-        Imgproc.bilateralFilter(gray, denoised, 5, 35.0, 35.0)
-        Core.addWeighted(gray, 1.25, denoised, -0.25, 0.0, sharpened)
+        gray.convertTo(contrast, -1, 1.38, 8.0)
+        Imgproc.bilateralFilter(contrast, denoised, 5, 42.0, 42.0)
+        Imgproc.GaussianBlur(denoised, blurred, CvSize(0.0, 0.0), 1.0)
+        Core.addWeighted(denoised, 1.55, blurred, -0.55, 0.0, sharpened)
 
         Bitmap.createBitmap(sharpened.cols(), sharpened.rows(), Bitmap.Config.ARGB_8888).also { result ->
             Utils.matToBitmap(sharpened, result)
@@ -1985,7 +2798,44 @@ private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     } finally {
         rgba.release()
         gray.release()
+        contrast.release()
         denoised.release()
+        blurred.release()
+        sharpened.release()
+    }
+}
+
+// 잘라낸 번호판 이미지를 OCR이 읽기 쉽게 OpenCV로 전처리합니다.
+// 확대 -> 흑백 변환 -> 명암 보정 -> 선명화 순서로 처리합니다.
+private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
+    if (!OpenCVLoader.initLocal()) {
+        error("OpenCV 초기화에 실패했습니다.")
+    }
+
+    val rgba = Mat()
+    val gray = Mat()
+    val contrast = Mat()
+    val denoised = Mat()
+    val blurred = Mat()
+    val sharpened = Mat()
+
+    return try {
+        Utils.bitmapToMat(bitmap, rgba)
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.equalizeHist(gray, contrast)
+        Imgproc.bilateralFilter(contrast, denoised, 5, 35.0, 35.0)
+        Imgproc.GaussianBlur(denoised, blurred, CvSize(0.0, 0.0), 0.8)
+        Core.addWeighted(denoised, 1.45, blurred, -0.45, 0.0, sharpened)
+
+        Bitmap.createBitmap(sharpened.cols(), sharpened.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(sharpened, result)
+        }
+    } finally {
+        rgba.release()
+        gray.release()
+        contrast.release()
+        denoised.release()
+        blurred.release()
         sharpened.release()
     }
 }
@@ -2001,7 +2851,7 @@ private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
     val blurred = Mat()
     val binary = Mat()
     val cleaned = Mat()
-    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(2.0, 2.0))
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(1.0, 1.0))
 
     return try {
         Utils.bitmapToMat(bitmap, rgba)
@@ -2027,37 +2877,41 @@ private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
 // assets/plate_ocr.onnx와 assets/charset.txt를 사용해 직접 학습한 번호판 OCR을 실행합니다.
 private fun adaptiveBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
-        error("OpenCV 珥덇린?붿뿉 ?ㅽ뙣?덉뒿?덈떎.")
+        error("OpenCV 초기화에 실패했습니다.")
     }
 
-    val scaledBitmap = Bitmap.createScaledBitmap(bitmap, bitmap.width * 2, bitmap.height * 2, true)
     val rgba = Mat()
     val gray = Mat()
     val denoised = Mat()
     val binary = Mat()
+    val cleaned = Mat()
+    val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, CvSize(1.0, 1.0))
 
     return try {
-        Utils.bitmapToMat(scaledBitmap, rgba)
+        Utils.bitmapToMat(bitmap, rgba)
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
-        Imgproc.bilateralFilter(gray, denoised, 5, 45.0, 45.0)
+        Imgproc.bilateralFilter(gray, denoised, 5, 38.0, 38.0)
         Imgproc.adaptiveThreshold(
             denoised,
             binary,
             255.0,
             Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
             Imgproc.THRESH_BINARY,
-            31,
-            7.0
+            35,
+            5.0
         )
+        Imgproc.morphologyEx(binary, cleaned, Imgproc.MORPH_CLOSE, kernel)
 
-        Bitmap.createBitmap(binary.cols(), binary.rows(), Bitmap.Config.ARGB_8888).also { result ->
-            Utils.matToBitmap(binary, result)
+        Bitmap.createBitmap(cleaned.cols(), cleaned.rows(), Bitmap.Config.ARGB_8888).also { result ->
+            Utils.matToBitmap(cleaned, result)
         }
     } finally {
         rgba.release()
         gray.release()
         denoised.release()
         binary.release()
+        cleaned.release()
+        kernel.release()
     }
 }
 
