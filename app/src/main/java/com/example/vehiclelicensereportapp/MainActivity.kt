@@ -55,6 +55,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -2053,6 +2054,7 @@ private fun ReportDetailScreen(
     onNextClick: () -> Unit
 ) {
     var warningMessage by remember { mutableStateOf("") }
+    val inputColors = reportDetailTextFieldColors()
 
     Column(
         modifier = Modifier
@@ -2094,7 +2096,8 @@ private fun ReportDetailScreen(
             label = { Text(text = "유형") },
             singleLine = true,
             readOnly = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = inputColors
         )
 
         OutlinedTextField(
@@ -2104,7 +2107,8 @@ private fun ReportDetailScreen(
             label = { Text(text = "첨부사진") },
             singleLine = true,
             readOnly = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = inputColors
         )
 
         OutlinedTextField(
@@ -2113,7 +2117,8 @@ private fun ReportDetailScreen(
             onValueChange = onPlateChange,
             label = { Text(text = "번호판 확인/수정") },
             singleLine = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = inputColors
         )
 
         OutlinedTextField(
@@ -2131,7 +2136,8 @@ private fun ReportDetailScreen(
             placeholder = { Text(text = "불법 주정차 위반 사항을 신고해 주세요.") },
             minLines = 5,
             maxLines = 5,
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.Black)
+            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.Black),
+            colors = inputColors
         )
 
         OutlinedTextField(
@@ -2143,7 +2149,8 @@ private fun ReportDetailScreen(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             visualTransformation = PhoneNumberVisualTransformation,
             placeholder = { Text(text = "010 - 1234 - 5678") },
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black)
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = inputColors
         )
 
         Spacer(modifier = Modifier.weight(1f))
@@ -2174,6 +2181,21 @@ private fun ReportDetailScreen(
         }
     }
 }
+
+@Composable
+private fun reportDetailTextFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = Color.Black,
+    unfocusedTextColor = Color.Black,
+    focusedLabelColor = primaryButtonColor,
+    unfocusedLabelColor = bodyTextColor,
+    focusedPlaceholderColor = Color(0xFFB9C0CC),
+    unfocusedPlaceholderColor = Color(0xFFB9C0CC),
+    focusedBorderColor = primaryButtonColor,
+    unfocusedBorderColor = Color(0xFF8F95A1),
+    cursorColor = primaryButtonColor,
+    focusedContainerColor = Color.White,
+    unfocusedContainerColor = Color.White
+)
 
 // 실제 접수 기록을 만들기 전에 허위 신고 책임을 마지막으로 확인시키는 단계입니다.
 @Composable
