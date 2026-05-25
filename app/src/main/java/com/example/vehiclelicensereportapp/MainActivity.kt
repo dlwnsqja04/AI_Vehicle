@@ -51,6 +51,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -100,14 +102,17 @@ import org.opencv.core.Point
 import org.opencv.core.Rect
 import org.opencv.core.Size as CvSize
 import org.opencv.imgproc.Imgproc
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.nio.FloatBuffer
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-// 앱의 시작점입니다. Compose 화면을 띄우고 전체 화면 흐름을 시작합니다.
+// Android 진입점은 Compose 루트만 연결하고, 실제 화면 흐름은 PlateReportApp에서 관리합니다.
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -120,8 +125,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 앱의 현재 화면 상태와 입력값을 관리하는 최상위 Compose 화면입니다.
-// 별도 Navigation 라이브러리 없이 enum 상태로 화면을 전환합니다.
+// 신고 접수 플로우 전체의 임시 입력값과 화면 이동 상태를 한 곳에서 관리합니다.
+// 별도 Navigation 라이브러리 없이 enum으로 화면을 전환해, 촬영/확인/완료 흐름을 단순하게 유지합니다.
 @Composable
 private fun PlateReportApp() {
     val context = LocalContext.current
@@ -134,11 +139,25 @@ private fun PlateReportApp() {
     var vehiclePhotoFileNames by remember { mutableStateOf("") }
     var reportContent by remember { mutableStateOf("") }
     var phoneNumberDigits by remember { mutableStateOf("") }
+    // 신고 완료 후 홈/신고내역 화면에 바로 반영하고, 앱을 다시 켜도 텍스트 기록은 남겨둡니다.
+    var reportHistory by remember { mutableStateOf(loadReportHistory(context)) }
+    var selectedHistoryReport by remember { mutableStateOf<ReportHistoryItem?>(null) }
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
                 PackageManager.PERMISSION_GRANTED
         )
+    }
+    // 신고 완료 후 홈으로 돌아갈 때 이전 접수 정보가 다음 신고에 섞이지 않도록 초기화합니다.
+    val resetReportDraft = {
+        selectedCategory = null
+        selectedViolationType = ""
+        recognizedPlate = ""
+        recognizedOcrText = ""
+        plateCropFilePath = ""
+        vehiclePhotoFileNames = ""
+        reportContent = ""
+        phoneNumberDigits = ""
     }
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -161,9 +180,14 @@ private fun PlateReportApp() {
         ) {
             when (currentScreen) {
                 AppScreen.Home -> HomeScreen(
+                    reports = reportHistory,
                     onReportClick = { currentScreen = AppScreen.Category },
                     onHistoryClick = {
-                        Toast.makeText(context, "신고내역 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
+                        currentScreen = AppScreen.ReportHistory
+                    },
+                    onReportSelected = { report ->
+                        selectedHistoryReport = report
+                        currentScreen = AppScreen.ReportHistoryDetail
                     },
                     onProfileClick = {
                         Toast.makeText(context, "프로필 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
@@ -262,15 +286,59 @@ private fun PlateReportApp() {
                 AppScreen.FalseReportWarning -> FalseReportWarningScreen(
                     onBackClick = { currentScreen = AppScreen.ReportDetail },
                     onReportClick = {
-                        Toast.makeText(context, "신고 기능은 다음 단계에서 연결합니다.", Toast.LENGTH_SHORT).show()
+                        val reportedAtMillis = System.currentTimeMillis()
+                        val newReport = ReportHistoryItem(
+                            id = reportedAtMillis.toString(),
+                            date = SimpleDateFormat("yyyy.MM.dd", Locale.KOREA).format(reportedAtMillis),
+                            time = SimpleDateFormat("HH:mm", Locale.KOREA).format(reportedAtMillis),
+                            year = SimpleDateFormat("yyyy", Locale.KOREA).format(reportedAtMillis).toInt(),
+                            month = SimpleDateFormat("MM", Locale.KOREA).format(reportedAtMillis).toInt(),
+                            reportedAtMillis = reportedAtMillis,
+                            categoryName = selectedCategory?.name.orEmpty(),
+                            violationType = selectedViolationType.ifBlank { "불법 주정차" },
+                            plate = recognizedPlate.ifBlank { "번호판 미입력" },
+                            content = reportContent,
+                            phoneNumber = phoneNumberDigits,
+                            photoFileNames = vehiclePhotoFileNames,
+                            status = "접수 완료"
+                        )
+                        val updatedHistory = listOf(newReport) + reportHistory
+                        reportHistory = updatedHistory
+                        saveReportHistory(context, updatedHistory)
+                        currentScreen = AppScreen.ReportComplete
                     }
                 )
+
+                AppScreen.ReportComplete -> ReportCompleteScreen(
+                    onHomeClick = {
+                        resetReportDraft()
+                        currentScreen = AppScreen.Home
+                    }
+                )
+
+                AppScreen.ReportHistory -> ReportHistoryScreen(
+                    reports = reportHistory,
+                    onReportSelected = { report ->
+                        selectedHistoryReport = report
+                        currentScreen = AppScreen.ReportHistoryDetail
+                    },
+                    onBackClick = { currentScreen = AppScreen.Home }
+                )
+
+                AppScreen.ReportHistoryDetail -> selectedHistoryReport?.let { report ->
+                    ReportHistoryDetailScreen(
+                        report = report,
+                        onBackClick = { currentScreen = AppScreen.ReportHistory }
+                    )
+                } ?: run {
+                    currentScreen = AppScreen.ReportHistory
+                }
             }
         }
     }
 }
 
-// 사용자가 이동할 수 있는 화면 목록입니다.
+// 앱의 주요 화면 단계입니다. 신고 과정은 위에서 아래 순서로 진행되고, 일부 화면은 뒤로 이동할 수 있습니다.
 private enum class AppScreen {
     Home,
     Category,
@@ -279,17 +347,94 @@ private enum class AppScreen {
     PlateConfirm,
     VehicleCamera,
     ReportDetail,
-    FalseReportWarning
+    FalseReportWarning,
+    ReportComplete,
+    ReportHistory,
+    ReportHistoryDetail
 }
 
-// 법령 카테고리와 그 아래에 들어갈 세부 위반유형 목록을 담는 데이터 구조입니다.
+// 법령 카테고리별로 선택 가능한 세부 위반 유형을 묶어 홈 이후의 신고 흐름에 전달합니다.
 private data class ViolationCategory(
     val name: String,
     val description: String,
     val types: List<String>
 )
 
-// 신고 유형 선택 화면에서 보여줄 법령 카테고리 데이터입니다.
+// 신고 완료 시점의 스냅샷입니다. 목록 표시와 상세 화면 복원을 위해 사용자가 입력/촬영한 값을 함께 저장합니다.
+private data class ReportHistoryItem(
+    val id: String,
+    val date: String,
+    val time: String,
+    val year: Int,
+    val month: Int,
+    val reportedAtMillis: Long,
+    val categoryName: String,
+    val violationType: String,
+    val plate: String,
+    val content: String,
+    val phoneNumber: String,
+    val photoFileNames: String,
+    val status: String
+)
+
+// 신고내역은 서버 연동 전 단계라 로컬 SharedPreferences에 JSON으로 보관합니다.
+// 사진은 파일명만 저장하고, 실제 이미지는 촬영 시 저장된 cacheDir 파일을 상세 화면에서 다시 읽습니다.
+private fun loadReportHistory(context: Context): List<ReportHistoryItem> {
+    val raw = context
+        .getSharedPreferences(REPORT_HISTORY_PREFS, Context.MODE_PRIVATE)
+        .getString(REPORT_HISTORY_ITEMS, "[]")
+        .orEmpty()
+    return runCatching {
+        val array = JSONArray(raw)
+        List(array.length()) { index ->
+            val item = array.getJSONObject(index)
+            ReportHistoryItem(
+                id = item.optString("id"),
+                date = item.optString("date"),
+                time = item.optString("time"),
+                year = item.optInt("year"),
+                month = item.optInt("month"),
+                reportedAtMillis = item.optLong("reportedAtMillis"),
+                categoryName = item.optString("categoryName"),
+                violationType = item.optString("violationType"),
+                plate = item.optString("plate"),
+                content = item.optString("content"),
+                phoneNumber = item.optString("phoneNumber"),
+                photoFileNames = item.optString("photoFileNames"),
+                status = item.optString("status")
+            )
+        }
+    }.getOrDefault(emptyList())
+}
+
+private fun saveReportHistory(context: Context, reports: List<ReportHistoryItem>) {
+    val array = JSONArray()
+    reports.forEach { report ->
+        array.put(
+            JSONObject()
+                .put("id", report.id)
+                .put("date", report.date)
+                .put("time", report.time)
+                .put("year", report.year)
+                .put("month", report.month)
+                .put("reportedAtMillis", report.reportedAtMillis)
+                .put("categoryName", report.categoryName)
+                .put("violationType", report.violationType)
+                .put("plate", report.plate)
+                .put("content", report.content)
+                .put("phoneNumber", report.phoneNumber)
+                .put("photoFileNames", report.photoFileNames)
+                .put("status", report.status)
+        )
+    }
+    context
+        .getSharedPreferences(REPORT_HISTORY_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(REPORT_HISTORY_ITEMS, array.toString())
+        .apply()
+}
+
+// 사용자에게 먼저 법령 기준을 고르게 하고, 다음 화면에서 해당 법령의 세부 유형만 보여줍니다.
 private val violationCategories = listOf(
     ViolationCategory(
         name = "도로교통법",
@@ -313,7 +458,7 @@ private val violationCategories = listOf(
     )
 )
 
-// 메인/카테고리 카드 버튼에 사용하는 그라데이션 색상 모음입니다.
+// 홈 메뉴와 법령 카테고리 카드가 같은 시각 언어를 갖도록 공통 그라데이션 팔레트를 사용합니다.
 private val tileGradients = listOf(
     listOf(Color(0xFF5ED477), Color(0xFF27C4B2)),
     listOf(Color(0xFF31CBB2), Color(0xFF2AC8C8)),
@@ -323,13 +468,16 @@ private val tileGradients = listOf(
     listOf(Color(0xFF426FE2), Color(0xFF3F62D8))
 )
 
-// 앱 전반에서 반복 사용하는 주요 색상입니다.
+// 주요 버튼/제목/본문에 반복되는 색상입니다. 화면 간 톤이 흔들리지 않도록 한 곳에서 관리합니다.
 private val primaryButtonColor = Color(0xFF456AE3)
 private val headingColor = Color(0xFF202638)
 private val bodyTextColor = Color(0xFF6D7485)
+private const val REPORT_HISTORY_PREFS = "report_history_prefs"
+private const val REPORT_HISTORY_ITEMS = "report_history_items"
+private const val REPORT_HISTORY_PAGE_SIZE = 7
 
-// 카메라 화면의 번호판 가이드 박스 비율입니다.
-// 예시 번호판처럼 가로로 길고 낮은 직사각형이 되도록 약 5:1 비율에 맞췄습니다.
+// 촬영 가이드와 실제 crop 계산이 같은 비율을 쓰도록 기준값을 공유합니다.
+// 국내 번호판의 긴 가로형 비율을 기준으로 잡되, 실제 사진 왜곡을 고려해 후보 탐색 범위는 넓게 둡니다.
 private const val PLATE_GUIDE_WIDTH_RATIO = 0.82f
 private const val PLATE_GUIDE_HEIGHT_RATIO = 0.14f
 private const val PLATE_GUIDE_TOP_RATIO = 0.38f
@@ -340,14 +488,26 @@ private const val OFFICIAL_PLATE_ASPECT_MIN = 2.75f
 private const val OFFICIAL_PLATE_ASPECT_MAX = 7.35f
 private val CAMERA_CAPTURE_RESOLUTION = Size(1920, 1080)
 
-// 앱 첫 화면입니다. 신고하기, 신고내역, 프로필, 도움말 버튼을 보여줍니다.
+// 홈에서는 신고 시작 동선을 가장 크게 두고, 최근 3개월 기록을 함께 보여줘 접수 결과로 자연스럽게 돌아오게 합니다.
 @Composable
 private fun HomeScreen(
+    reports: List<ReportHistoryItem>,
     onReportClick: () -> Unit,
     onHistoryClick: () -> Unit,
+    onReportSelected: (ReportHistoryItem) -> Unit,
     onProfileClick: () -> Unit
 ) {
     val context = LocalContext.current
+    val threeMonthsAgo = Calendar.getInstance(Locale.KOREA).apply {
+        add(Calendar.MONTH, -3)
+    }.timeInMillis
+    val recentThreeMonthReports = reports
+        .filter { report -> report.reportedAtMillis >= threeMonthsAgo }
+        .sortedByDescending { it.reportedAtMillis }
+    val recentThreeMonthSlots = recentThreeMonthReports
+        .take(3)
+        .map<ReportHistoryItem, ReportHistoryItem?> { it } +
+        List((3 - recentThreeMonthReports.size).coerceAtLeast(0)) { null }
 
     Column(
         modifier = Modifier
@@ -414,10 +574,727 @@ private fun HomeScreen(
                 }
             )
         }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        RecentThreeMonthHistorySection(
+            reports = recentThreeMonthSlots,
+            onReportSelected = onReportSelected
+        )
     }
 }
 
-// 그라데이션이 들어간 큰 메뉴 카드입니다. 메인 메뉴와 카테고리 선택에 함께 사용합니다.
+// 홈 하단 요약 카드입니다. 비어 있어도 3개 슬롯을 유지해 화면 높이가 갑자기 변하지 않게 합니다.
+@Composable
+private fun RecentThreeMonthHistorySection(
+    reports: List<ReportHistoryItem?>,
+    onReportSelected: (ReportHistoryItem) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F7FE))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "최근 3개월간 신고내역",
+                        fontSize = 19.sp,
+                        lineHeight = 24.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = headingColor
+                    )
+                    Text(
+                        text = "최근 접수 기준 3건",
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = bodyTextColor
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .background(Color.White, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Text(
+                        text = "3개월",
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = primaryButtonColor
+                    )
+                }
+            }
+
+            reports.forEach { report ->
+                RecentHistoryRow(
+                    report = report,
+                    onClick = { selectedReport -> onReportSelected(selectedReport) }
+                )
+            }
+        }
+    }
+}
+
+// 신고내역 전체 조회 화면입니다. 기간 필터, 정렬, 페이지네이션을 조합해 많은 기록도 한 화면 단위로 확인합니다.
+@Composable
+private fun ReportHistoryScreen(
+    reports: List<ReportHistoryItem>,
+    onReportSelected: (ReportHistoryItem) -> Unit,
+    onBackClick: () -> Unit
+) {
+    val currentYear = SimpleDateFormat("yyyy", Locale.KOREA).format(System.currentTimeMillis()).toInt()
+    val currentMonth = SimpleDateFormat("MM", Locale.KOREA).format(System.currentTimeMillis()).toInt()
+    var selectedYear by remember { mutableStateOf(currentYear) }
+    var selectedMonth by remember { mutableStateOf(currentMonth) }
+    var newestFirst by remember { mutableStateOf(true) }
+    var currentPage by remember { mutableStateOf(0) }
+    val monthRangeOptions = (currentYear downTo currentYear - 1).flatMap { year ->
+        (12 downTo 1).map { month -> year to month }
+    }
+    val filteredReports = reports.filter { report ->
+        report.year == selectedYear && report.month == selectedMonth
+    }
+    val sortedFilteredReports = if (newestFirst) {
+        filteredReports.sortedByDescending { it.reportedAtMillis }
+    } else {
+        filteredReports.sortedBy { it.reportedAtMillis }
+    }
+    // 필터나 정렬이 바뀌어 현재 페이지가 범위를 벗어나면 마지막 페이지로 보정합니다.
+    val totalPages = ((sortedFilteredReports.size + REPORT_HISTORY_PAGE_SIZE - 1) / REPORT_HISTORY_PAGE_SIZE)
+        .coerceAtLeast(1)
+    if (currentPage >= totalPages) {
+        currentPage = totalPages - 1
+    }
+    val pagedReports = sortedFilteredReports
+        .drop(currentPage * REPORT_HISTORY_PAGE_SIZE)
+        .take(REPORT_HISTORY_PAGE_SIZE)
+    val hasPreviousPage = currentPage > 0
+    val hasNextPage = currentPage < totalPages - 1
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFEEF4FC))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "상세 내역",
+                        fontSize = 22.sp,
+                        lineHeight = 26.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = headingColor
+                    )
+                    Text(
+                        text = "기간별 신고 상태 확인",
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = bodyTextColor
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    DateRangeFilterButton(
+                        modifier = Modifier.weight(1.2f),
+                        label = monthRangeLabel(selectedYear, selectedMonth),
+                        options = monthRangeOptions,
+                        visibleMenuItems = 4,
+                        onOptionSelected = { year, month ->
+                            selectedYear = year
+                            selectedMonth = month
+                            currentPage = 0
+                        }
+                    )
+                    Row(
+                        modifier = Modifier.weight(1.05f),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        SortChip(
+                            text = "최신순",
+                            selected = newestFirst,
+                            onClick = {
+                                newestFirst = true
+                                currentPage = 0
+                            }
+                        )
+                        Spacer(modifier = Modifier.size(6.dp))
+                        SortChip(
+                            text = "오래된순",
+                            selected = !newestFirst,
+                            onClick = {
+                                newestFirst = false
+                                currentPage = 0
+                            }
+                        )
+                    }
+                }
+
+                if (sortedFilteredReports.isEmpty()) {
+                    Text(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 34.dp),
+                        text = "선택한 기간의 신고 내역이 없습니다",
+                        fontSize = 15.sp,
+                        lineHeight = 22.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = bodyTextColor,
+                        textAlign = TextAlign.Center
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        pagedReports.forEach { report ->
+                            ReportHistoryRow(
+                                report = report,
+                                onClick = { selectedReport -> onReportSelected(selectedReport) }
+                            )
+                        }
+                    }
+                }
+
+                if (sortedFilteredReports.size > REPORT_HISTORY_PAGE_SIZE) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    HistoryPageControls(
+                        hasPreviousPage = hasPreviousPage,
+                        hasNextPage = hasNextPage,
+                        onPreviousClick = { currentPage = (currentPage - 1).coerceAtLeast(0) },
+                        onNextClick = { currentPage = (currentPage + 1).coerceAtMost(totalPages - 1) }
+                    )
+                }
+            }
+        }
+
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "홈으로 돌아가기",
+            onClick = onBackClick
+        )
+    }
+}
+
+@Composable
+private fun HistoryPageControls(
+    hasPreviousPage: Boolean,
+    hasNextPage: Boolean,
+    onPreviousClick: () -> Unit,
+    onNextClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        if (hasPreviousPage) {
+            Button(
+                modifier = Modifier.weight(1f).height(44.dp),
+                onClick = onPreviousClick,
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = primaryButtonColor,
+                    contentColor = Color.White
+                )
+            ) {
+                Text(
+                    text = "이전 페이지",
+                    fontSize = 15.sp,
+                    lineHeight = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+        if (hasNextPage) {
+            Button(
+                modifier = Modifier.weight(1f).height(44.dp),
+                onClick = onNextClick,
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = primaryButtonColor,
+                    contentColor = Color.White
+                )
+            ) {
+                Text(
+                    text = "다음 페이지",
+                    fontSize = 15.sp,
+                    lineHeight = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecentHistoryRow(
+    report: ReportHistoryItem?,
+    onClick: (ReportHistoryItem) -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(50.dp)
+            .then(if (report == null) Modifier else Modifier.clickable { onClick(report) }),
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (report == null) {
+                Text(
+                    text = "신고 기록 없음",
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = bodyTextColor.copy(alpha = 0.72f)
+                )
+                Text(
+                    text = "--------",
+                    fontSize = 14.sp,
+                    lineHeight = 18.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = bodyTextColor.copy(alpha = 0.72f)
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = report.violationType,
+                        fontSize = 14.sp,
+                        lineHeight = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = headingColor
+                    )
+                    Text(
+                        text = report.date,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = bodyTextColor
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .background(Color(0xFFEAF1FF), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Text(
+                        text = report.status,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = primaryButtonColor
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SortChip(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .background(
+                color = if (selected) primaryButtonColor else Color.White,
+                shape = RoundedCornerShape(8.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 9.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = text,
+            fontSize = 11.sp,
+            lineHeight = 14.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (selected) Color.White else bodyTextColor
+        )
+    }
+}
+
+@Composable
+private fun DateRangeFilterButton(
+    modifier: Modifier = Modifier,
+    label: String,
+    options: List<Pair<Int, Int>>,
+    visibleMenuItems: Int,
+    onOptionSelected: (year: Int, month: Int) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Box(modifier = modifier) {
+        Button(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(40.dp),
+            onClick = { expanded = true },
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color.White,
+                contentColor = headingColor
+            )
+        ) {
+            Text(
+                text = "$label ▼",
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.height((visibleMenuItems * 48 + 16).dp)
+        ) {
+            options.forEach { (year, month) ->
+                DropdownMenuItem(
+                    text = { Text(text = monthRangeLabel(year, month)) },
+                    onClick = {
+                        expanded = false
+                        onOptionSelected(year, month)
+                    }
+                )
+            }
+        }
+    }
+}
+
+private fun monthRangeLabel(year: Int, month: Int): String {
+    val calendar = Calendar.getInstance(Locale.KOREA)
+    calendar.set(Calendar.YEAR, year)
+    calendar.set(Calendar.MONTH, month - 1)
+    calendar.set(Calendar.DAY_OF_MONTH, 1)
+    val lastDay = calendar.getActualMaximum(Calendar.DAY_OF_MONTH)
+    return String.format(
+        Locale.KOREA,
+        "%02d.%02d.01~%02d.%02d.%02d",
+        year % 100,
+        month,
+        year % 100,
+        month,
+        lastDay
+    )
+}
+
+@Composable
+private fun HistoryFilterButton(
+    modifier: Modifier = Modifier,
+    label: String,
+    options: List<String>,
+    visibleMenuItems: Int? = null,
+    onOptionSelected: (String) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val menuModifier = visibleMenuItems?.let { count ->
+        Modifier.height((count * 48 + 16).dp)
+    } ?: Modifier
+
+    Box(modifier = modifier) {
+        Button(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp),
+            onClick = { expanded = true },
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color.White,
+                contentColor = headingColor
+            )
+        ) {
+            Text(text = label, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = menuModifier
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(text = option) },
+                    onClick = {
+                        expanded = false
+                        onOptionSelected(option)
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReportHistoryRow(
+    report: ReportHistoryItem?,
+    onClick: (ReportHistoryItem) -> Unit = {}
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (report == null) Modifier else Modifier.clickable { onClick(report) }),
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 9.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(
+                    text = report?.date ?: "-",
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = bodyTextColor
+                )
+                Text(
+                    text = if (report == null) "-" else "${report.violationType} · ${report.plate}",
+                    fontSize = 14.sp,
+                    lineHeight = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (report == null) bodyTextColor else headingColor
+                )
+            }
+            Text(
+                text = report?.status ?: "-",
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (report == null) bodyTextColor else primaryButtonColor
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReportHistoryDetailScreen(
+    report: ReportHistoryItem,
+    onBackClick: () -> Unit
+) {
+    // 차량 사진은 두 장을 "file1, file2" 형태로 저장하므로 상세 화면에서는 파일명 배열로 다시 분리합니다.
+    val photoFileNames = report.photoFileNames
+        .split(",")
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Spacer(modifier = Modifier.height(30.dp))
+
+        Text(
+            text = "신고 상세 내역",
+            fontSize = 30.sp,
+            lineHeight = 36.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "${report.date} ${report.time} 접수",
+            fontSize = 15.sp,
+            lineHeight = 20.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F7FE))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "세부 위반 내역",
+                    fontSize = 21.sp,
+                    lineHeight = 26.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = headingColor
+                )
+                ReportInfoRow(label = "처리 상태", value = report.status)
+                ReportInfoRow(label = "법령", value = report.categoryName.ifBlank { "미입력" })
+                ReportInfoRow(label = "위반 유형", value = report.violationType)
+                ReportInfoRow(label = "번호판", value = report.plate)
+                ReportInfoRow(label = "연락처", value = formatPhoneNumber(report.phoneNumber))
+                ReportInfoRow(label = "신고 내용", value = report.content.ifBlank { "입력된 내용 없음" })
+            }
+        }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F7FE))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "저장된 차량 사진",
+                    fontSize = 21.sp,
+                    lineHeight = 26.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = headingColor
+                )
+                if (photoFileNames.isEmpty()) {
+                    EmptyPhotoBox(message = "저장된 사진 파일이 없습니다")
+                } else {
+                    photoFileNames.forEachIndexed { index, fileName ->
+                        SavedVehiclePhotoPreview(
+                            title = "차량 사진 ${index + 1}",
+                            fileName = fileName
+                        )
+                    }
+                }
+            }
+        }
+
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "신고내역으로 돌아가기",
+            onClick = onBackClick
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun ReportInfoRow(
+    label: String,
+    value: String
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = bodyTextColor
+        )
+        Text(
+            text = value,
+            fontSize = 15.sp,
+            lineHeight = 21.sp,
+            fontWeight = FontWeight.Medium,
+            color = headingColor
+        )
+    }
+}
+
+@Composable
+private fun SavedVehiclePhotoPreview(
+    title: String,
+    fileName: String
+) {
+    val context = LocalContext.current
+    // 신고 기록에는 파일명만 남기고, 실제 이미지는 촬영 당시 cacheDir에 저장된 파일을 읽어 표시합니다.
+    val bitmap = remember(fileName) {
+        BitmapFactory.decodeFile(File(context.cacheDir, fileName).absolutePath)
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = "$title · $fileName",
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = bodyTextColor
+        )
+        if (bitmap == null) {
+            EmptyPhotoBox(message = "사진 파일을 찾을 수 없습니다")
+        } else {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = title,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(170.dp)
+                    .background(Color.White, RoundedCornerShape(8.dp)),
+                contentScale = ContentScale.Crop
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmptyPhotoBox(message: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(120.dp)
+            .background(Color.White, RoundedCornerShape(8.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = message,
+            fontSize = 14.sp,
+            lineHeight = 20.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+private fun formatPhoneNumber(phoneNumber: String): String {
+    return if (phoneNumber.length == 11) {
+        "${phoneNumber.substring(0, 3)}-${phoneNumber.substring(3, 7)}-${phoneNumber.substring(7)}"
+    } else {
+        phoneNumber.ifBlank { "미입력" }
+    }
+}
+
+// 메인 메뉴와 법령 선택을 같은 카드 패턴으로 보여줘 사용자가 "선택 가능한 항목"을 한눈에 알아보게 합니다.
 @Composable
 private fun GradientMenuCard(
     modifier: Modifier = Modifier,
@@ -463,7 +1340,7 @@ private fun GradientMenuCard(
     }
 }
 
-// 파란색 기본 액션 버튼입니다. 이전/다음/신고하기 같은 주요 버튼에 공통 적용합니다.
+// 주요 행동 버튼의 크기와 색을 통일해 이전/다음/완료/홈 이동 버튼이 같은 우선순위로 보이게 합니다.
 @Composable
 private fun PrimaryActionButton(
     modifier: Modifier = Modifier,
@@ -487,7 +1364,7 @@ private fun PrimaryActionButton(
     }
 }
 
-// 신고하기를 눌렀을 때 먼저 보이는 법령 카테고리 선택 화면입니다.
+// 법령 카테고리를 먼저 고르게 해서 이후 세부 유형 목록을 불필요하게 길게 만들지 않습니다.
 @Composable
 private fun ViolationCategoryScreen(
     onBackClick: () -> Unit,
@@ -536,7 +1413,7 @@ private fun ViolationCategoryScreen(
     }
 }
 
-// 선택한 법령 카테고리에 맞는 세부 위반유형 목록을 보여주는 화면입니다.
+// 사용자가 선택한 법령 안에서만 세부 위반 유형을 고르게 해 잘못된 조합으로 신고하지 않도록 합니다.
 @Composable
 private fun ViolationTypeScreen(
     category: ViolationCategory?,
@@ -587,7 +1464,7 @@ private fun ViolationTypeScreen(
     }
 }
 
-// 카메라 권한이 없을 때 권한 요청 버튼을 보여주는 화면입니다.
+// 카메라 권한이 거부된 상태에서 촬영 화면으로 넘어가지 않도록 권한 요청 동선을 분리합니다.
 @Composable
 private fun PermissionScreen(
     onBackClick: () -> Unit,
@@ -621,8 +1498,7 @@ private fun PermissionScreen(
     }
 }
 
-// 번호판 OCR용 사진을 1장 촬영하는 카메라 화면입니다.
-// 촬영 후 OpenCV가 번호판 후보 영역을 잘라내고, 직접 학습한 OCR 결과를 확인 화면으로 넘깁니다.
+// 번호판 인식을 위한 촬영 단계입니다. 화면 가이드와 같은 영역을 우선 crop해 OCR 후보를 만들고, 사용자가 다음 화면에서 수정할 수 있게 넘깁니다.
 @Composable
 private fun PlateOcrCameraScreen(
     categoryName: String,
@@ -642,7 +1518,7 @@ private fun PlateOcrCameraScreen(
     }
 
     var isProcessing by remember { mutableStateOf(false) }
-    val captureMessage = "번호판이 보이게 차량 사진을 찍어주세요"
+    val captureMessage = "테두리 안에 번호판을 넣어 찍어주세요"
 
     DisposableEffect(Unit) {
         onDispose {
@@ -787,8 +1663,7 @@ private fun PlateOcrCameraScreen(
     }
 }
 
-// 신고 증빙용 차량 사진을 앞/뒤 2장 촬영하는 카메라 화면입니다.
-// 이 단계는 OCR이 아니라 첨부사진 확보가 목적이므로 번호판 테두리 없이 전체 차량을 촬영합니다.
+// 신고 증빙용 차량 사진을 두 장 확보합니다. OCR은 이미 끝난 뒤라 여기서는 파일 저장과 첨부 기록만 담당합니다.
 @Composable
 private fun VehiclePhotoCameraScreen(
     categoryName: String,
@@ -956,7 +1831,7 @@ private fun VehiclePhotoCameraScreen(
     }
 }
 
-// 카메라 화면 상단에 표시되는 흰색 안내 배너입니다.
+// 촬영 중 사용자가 지금 해야 할 행동을 짧게 안내하는 공통 배너입니다.
 @Composable
 private fun CaptureNotice(
     modifier: Modifier = Modifier,
@@ -991,7 +1866,7 @@ private fun CaptureNotice(
     }
 }
 
-// 번호판을 맞춰 찍을 수 있도록 카메라 프리뷰 위에 그리는 흰색 가이드 박스입니다.
+// 화면에 보이는 가이드 비율과 실제 crop 비율을 맞춰 OCR 대상 영역이 사용자의 기대와 어긋나지 않게 합니다.
 @Composable
 private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
@@ -1011,7 +1886,7 @@ private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
     }
 }
 
-// 입력값이 부족하거나 형식이 맞지 않을 때 보여주는 공통 경고 배너입니다.
+// 다음 단계로 넘어가기 전에 빠진 입력이나 형식 오류를 화면 상단에서 즉시 알려줍니다.
 @Composable
 private fun InlineWarningBanner(
     modifier: Modifier = Modifier,
@@ -1047,7 +1922,7 @@ private fun InlineWarningBanner(
     }
 }
 
-// OCR로 읽은 번호판을 사용자가 확인하고 수정하는 화면입니다.
+// OCR 결과를 바로 제출하지 않고, 번호판 crop과 원문 OCR을 보여준 뒤 사용자가 직접 수정할 수 있게 합니다.
 @Composable
 private fun PlateConfirmScreen(
     plate: String,
@@ -1163,7 +2038,7 @@ private fun PlateConfirmScreen(
     }
 }
 
-// 최종 신고 전에 유형, 첨부사진, 번호판, 내용, 휴대전화를 확인하고 입력하는 화면입니다.
+// 제출 직전 단계입니다. 촬영된 첨부 파일명과 OCR 번호판을 확인하고, 신고 내용/연락처를 함께 수집합니다.
 @Composable
 private fun ReportDetailScreen(
     violationType: String,
@@ -1300,7 +2175,7 @@ private fun ReportDetailScreen(
     }
 }
 
-// 허위 신고에 대한 법적 책임을 한 번 더 안내하는 최종 경고 화면입니다.
+// 실제 접수 기록을 만들기 전에 허위 신고 책임을 마지막으로 확인시키는 단계입니다.
 @Composable
 private fun FalseReportWarningScreen(
     onBackClick: () -> Unit,
@@ -1368,7 +2243,73 @@ private fun FalseReportWarningScreen(
     }
 }
 
-// CameraX로 사진을 파일에 저장한 뒤 OCR 처리 함수로 넘깁니다.
+// 접수 완료 후 사용자가 다음에 어디서 확인하면 되는지 안내하고, 홈으로 돌아가도록 마무리합니다.
+@Composable
+private fun ReportCompleteScreen(
+    onHomeClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Canvas(modifier = Modifier.size(112.dp)) {
+            val strokeWidth = 9.dp.toPx()
+            drawCircle(
+                color = Color(0xFF21A8F3),
+                style = Stroke(width = strokeWidth)
+            )
+            drawLine(
+                color = Color(0xFF21A8F3),
+                start = Offset(size.width * 0.28f, size.height * 0.54f),
+                end = Offset(size.width * 0.43f, size.height * 0.70f),
+                strokeWidth = 13.dp.toPx(),
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = Color(0xFF21A8F3),
+                start = Offset(size.width * 0.43f, size.height * 0.70f),
+                end = Offset(size.width * 0.76f, size.height * 0.30f),
+                strokeWidth = 13.dp.toPx(),
+                cap = StrokeCap.Round
+            )
+        }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Text(
+            text = "신고가 완료되었습니다",
+            fontSize = 24.sp,
+            lineHeight = 30.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "최종 처리는 7일에서 14일 정도 소요됩니다.\n신고 내역은 홈 > 신고내역 페이지에서 확인이 가능합니다",
+            fontSize = 15.sp,
+            lineHeight = 22.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(36.dp))
+
+        PrimaryActionButton(
+            modifier = Modifier.fillMaxWidth(),
+            text = "홈으로 돌아가기",
+            onClick = onHomeClick
+        )
+    }
+}
+
+// 번호판 OCR용 원본 사진을 cacheDir에 저장하고, 저장된 파일을 기준으로 crop/OCR 파이프라인을 시작합니다.
 private fun captureAndRecognizePlate(
     context: Context,
     imageCapture: ImageCapture,
@@ -1412,7 +2353,7 @@ private fun captureAndRecognizePlate(
     )
 }
 
-// OCR 없이 첨부용 사진만 저장합니다. 결과는 신고정보 확인 화면의 첨부사진 항목에 표시합니다.
+// 차량 증빙 사진은 OCR이 필요 없으므로 파일 저장 후 파일명만 신고 입력 상태에 반영합니다.
 private fun capturePhoto(
     context: Context,
     imageCapture: ImageCapture,
@@ -1443,7 +2384,7 @@ private fun capturePhoto(
     )
 }
 
-// 저장된 사진에서 번호판 가이드 영역만 잘라내고 보정한 뒤 직접 학습한 ONNX OCR을 실행합니다.
+// 저장된 사진을 실제 방향으로 보정한 뒤, 가이드 crop과 OpenCV 후보 crop을 모두 OCR 후보로 평가합니다.
 private fun recognizePlateFromImage(
     context: Context,
     uri: Uri,
@@ -1469,7 +2410,7 @@ private fun recognizePlateFromImage(
     )
 }
 
-// 여러 crop/전처리 후보를 모두 OCR에 넣고, 번호판 형식에 가장 가까운 결과를 선택합니다.
+// crop 방식과 전처리 방식마다 OCR 결과가 달라질 수 있어 여러 후보를 평가하고 가장 번호판다운 결과를 고릅니다.
 private fun processPlateBitmapCandidates(
     context: Context,
     bitmaps: List<Bitmap>,
@@ -1539,8 +2480,7 @@ private fun processPlateBitmapCandidates(
         }
     }
 
-    // 정규 번호판 형식(숫자 2~3개 + 한글 1개 + 숫자 4개)이 하나라도 있으면,
-    // 한글이 없는 숫자열 fallback은 선택하지 않습니다.
+    // 정규 번호판 형식이 하나라도 있으면 한글이 빠진 숫자열 fallback보다 우선합니다.
     val strictCandidates = candidateResults.filter { result ->
         isStrictKoreanPlate(result.plateText)
     }
@@ -1567,7 +2507,7 @@ private fun processPlateBitmapCandidates(
     onError("번호판 형식으로 인식하지 못했습니다. 번호판이 선명하게 보이도록 다시 촬영해주세요.")
 }
 
-// 번호판 정규식에 실패한 OCR 결과 중에서도 사용자가 수정하기 쉬운 후보를 고릅니다.
+// 정규식에 딱 맞지 않아도 사용자가 확인 화면에서 고치기 쉬운 후보를 살리기 위한 점수입니다.
 private fun scoreOcrFallback(text: String): Int {
     if (text.isBlank()) return Int.MIN_VALUE
 
@@ -1579,7 +2519,7 @@ private fun scoreOcrFallback(text: String): Int {
     return score
 }
 
-// 촬영 이미지에 저장된 EXIF 회전 정보를 읽어 실제 방향에 맞는 Bitmap으로 돌려줍니다.
+// 여러 OCR 후보를 비교할 때 crop 이미지, 원문, 정규화 결과, 점수를 함께 들고 다닙니다.
 private data class OcrCandidateResult(
     val bitmap: Bitmap,
     val ocrText: String,
@@ -1617,6 +2557,7 @@ private fun isStrictKoreanPlate(text: String): Boolean {
     return Regex("^[0-9]{2,3}[가-힣][0-9]{4}$").matches(text)
 }
 
+// 너무 어둡거나, 가장자리에 장식/노이즈가 많이 잡힌 crop은 번호판 후보 점수에서 감점합니다.
 private fun estimatePreprocessingCandidatePenalty(bitmap: Bitmap): Int {
     return estimateBinaryCandidatePenalty(bitmap) +
         estimateSideArtifactPenalty(bitmap) +
@@ -1697,6 +2638,7 @@ private fun estimateDarkRatio(bitmap: Bitmap, startX: Int, endX: Int): Float {
     return dark.toFloat() / total.coerceAtLeast(1)
 }
 
+// 여러 전처리 후보가 같은 번호판을 가리킬 때, 점수와 빈도를 함께 봐서 최종 문자열을 안정화합니다.
 private fun buildPlateConsensus(results: List<OcrCandidateResult>): String? {
     if (results.isEmpty()) return null
 
@@ -1799,6 +2741,7 @@ private fun recognizePlateByCharacterSegments(context: Context, bitmap: Bitmap):
     return plate.takeIf { findKoreanPlateCandidate(it) == it }
 }
 
+// 번호판 한 글자씩의 세로 획 묶음을 찾아 단일 글자 OCR 입력으로 사용할 작은 이미지를 만듭니다.
 private fun extractCharacterBitmaps(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -1967,7 +2910,7 @@ private fun loadOrientedBitmap(context: Context, uri: Uri): Bitmap {
     return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
 }
 
-// 화면의 번호판 가이드 박스와 같은 비율로 원본 사진의 중앙 영역을 잘라냅니다.
+// 사용자가 화면에서 맞춘 흰색 가이드 위치와 같은 중앙 영역을 원본 사진에서도 잘라냅니다.
 private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
     val cropWidth = (bitmap.width * PLATE_GUIDE_WIDTH_RATIO).toInt().coerceAtLeast(1)
     val cropHeight = (bitmap.height * PLATE_GUIDE_HEIGHT_RATIO).toInt().coerceAtLeast(1)
@@ -1979,7 +2922,7 @@ private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
     return Bitmap.createBitmap(bitmap, left, top, safeWidth, safeHeight)
 }
 
-// 전체 차량 사진에서 OpenCV로 번호판처럼 보이는 가로형 후보 영역을 찾아 OCR 후보로 만듭니다.
+// 가이드 crop이 빗나간 경우를 보완하기 위해 사진 전체에서 번호판 비율에 가까운 사각형 후보를 추가로 찾습니다.
 private fun cropBrightPlateAreaInsideGuide(bitmap: Bitmap): Bitmap {
     if (bitmap.width <= 2 || bitmap.height <= 2) return bitmap
 
@@ -2160,7 +3103,7 @@ private fun buildPlateBitmapCandidates(bitmap: Bitmap): List<Bitmap> {
 private const val NORMALIZED_PLATE_WIDTH = 768
 private const val NORMALIZED_PLATE_HEIGHT = 192
 
-// 모든 OCR 후보를 같은 해상도 캔버스에 맞춰 후속 전처리와 화면 확인 결과가 흔들리지 않게 합니다.
+// 후보 이미지 크기를 통일해 전처리 강도와 ONNX 입력 스케일이 후보마다 달라지지 않게 합니다.
 private fun normalizePlateResolution(bitmap: Bitmap): Bitmap {
     val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
     val scale = minOf(
@@ -2298,7 +3241,7 @@ private data class CharacterGroup(
     val score: Double
 )
 
-// 번호판 외곽선보다 글자 contour 묶음을 먼저 찾고, 그 묶음을 기준으로 번호판 crop을 정교화합니다.
+// 번호판 테두리 검출이 흔들릴 때 글자 contour 묶음을 기준으로 crop 영역을 더 정교하게 보정합니다.
 private fun detectPlateCandidatesByCharacterGroups(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2547,8 +3490,7 @@ private fun expandCharacterGroupBounds(bounds: Rect, imageWidth: Int, imageHeigh
     return Rect(left, top, (right - left).coerceAtLeast(1), (bottom - top).coerceAtLeast(1))
 }
 
-// Canny edge와 contour를 이용해 번호판 비율에 가까운 사각형 영역을 찾습니다.
-// Expands a detected 7/8-character run back to the official 520x110 plate ratio.
+// 글자 묶음 주변을 실제 번호판 비율로 다시 확장해 한쪽이 잘린 crop을 줄입니다.
 private fun expandCharacterGroupBoundsToOfficialPlateRatio(
     bounds: Rect,
     imageWidth: Int,
@@ -2579,7 +3521,7 @@ private fun expandCharacterGroupBoundsToOfficialPlateRatio(
     return Rect(left, top, targetWidthInt, targetHeightInt)
 }
 
-// Finds wide plate-like rectangles with Canny edges as a fallback candidate source.
+// 글자 contour 보정이 실패했을 때를 대비해 edge 기반의 넓은 사각형 후보를 fallback으로 사용합니다.
 private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2639,7 +3581,7 @@ private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
     }
 }
 
-// 실제 OCR에 넣은 번호판 crop 이미지를 캐시에 저장해 확인 화면에서 보여줍니다.
+// 사용자가 OCR 결과를 신뢰할 수 있도록 실제 OCR에 사용한 crop 이미지를 확인 화면에 보여줍니다.
 private fun saveDebugPlateCrop(context: Context, bitmap: Bitmap, sourceFileName: String): String {
     val debugFile = File(
         context.cacheDir,
@@ -2651,7 +3593,7 @@ private fun saveDebugPlateCrop(context: Context, bitmap: Bitmap, sourceFileName:
     return debugFile.absolutePath
 }
 
-// 화면 재촬영에서 생기는 촘촘한 줄무늬를 약하게 만들기 위해 살짝 흐림 처리합니다.
+// 모니터/카메라 재촬영에서 생기는 촘촘한 줄무늬가 OCR 획으로 인식되지 않도록 약하게 완화합니다.
 private fun smoothPlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2676,8 +3618,7 @@ private fun smoothPlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 글자 획을 깨뜨리지 않는 선에서 회색조, 대비 보정, 노이즈 완화, 선명화를 적용합니다.
-// 강한 이진화보다 먼저 OCR 후보에 넣어 한글 획 손상을 줄입니다.
+// 한글 획 손상을 줄이기 위해 강한 이진화 전, 대비/노이즈/선명도만 보정한 후보를 먼저 만듭니다.
 private fun strongBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2719,8 +3660,7 @@ private fun strongBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 획이 얇게 나온 번호판을 위해 검은 글자를 1~2픽셀 정도 더 두껍게 만든 OCR 후보를 만듭니다.
-// 흰 배경은 유지하고 검은 글자만 키워서 2/3/5/6/8처럼 헷갈리는 숫자의 특징을 더 분명하게 합니다.
+// 얇게 찍힌 글자는 숫자 특징이 약해져서, 검은 획만 조금 두껍게 만든 후보도 OCR에 함께 넣습니다.
 private fun boldBinarizePlateBitmap(bitmap: Bitmap, iterations: Int): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2745,7 +3685,7 @@ private fun boldBinarizePlateBitmap(bitmap: Bitmap, iterations: Int): Bitmap {
         Core.addWeighted(contrast, 1.85, blurred, -0.85, 0.0, sharpened)
         Imgproc.threshold(sharpened, binary, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
 
-        // OpenCV의 erode는 흰 영역을 줄이므로, 흰 배경/검은 글자 이미지에서는 검은 획이 두꺼워집니다.
+        // 흰 배경/검은 글자 이미지에서는 흰 영역을 줄이면 상대적으로 검은 획이 두꺼워집니다.
         Imgproc.erode(
             binary,
             thickened,
@@ -2805,8 +3745,7 @@ private fun enhanceReadablePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 잘라낸 번호판 이미지를 OCR이 읽기 쉽게 OpenCV로 전처리합니다.
-// 확대 -> 흑백 변환 -> 명암 보정 -> 선명화 순서로 처리합니다.
+// crop된 번호판을 확대하고 명암을 정리해 ONNX 모델이 학습 때와 비슷한 입력을 받게 합니다.
 private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2840,7 +3779,7 @@ private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 글자는 검정, 배경은 흰색에 가깝게 분리해 줄무늬 배경 영향을 줄이는 후보를 만듭니다.
+// 배경 줄무늬나 그림자를 줄이기 위해 글자와 배경을 더 강하게 분리한 후보도 준비합니다.
 private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2873,8 +3812,8 @@ private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// OCR 전체 결과에서 한국 번호판 형식에 맞는 문자열만 골라냅니다.
-// assets/plate_ocr.onnx와 assets/charset.txt를 사용해 직접 학습한 번호판 OCR을 실행합니다.
+// 전체 번호판 CTC 모델 결과에서 한국 번호판 형식에 가까운 문자열만 후보로 추립니다.
+// 모델과 charset은 assets에 포함된 학습 결과를 사용합니다.
 private fun adaptiveBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2960,7 +3899,7 @@ private object PlateOcrOnnxRecognizer {
         }
     }
 
-    // 학습 코드와 같은 방식으로 비율 유지 resize, 흰색 padding, [-1, 1] 정규화를 적용합니다.
+    // 학습 코드와 같은 전처리를 적용해야 실제 추론에서도 문자 위치와 밝기 분포가 맞습니다.
     private fun bitmapToModelInput(bitmap: Bitmap): FloatArray {
         val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
         val scale = minOf(INPUT_WIDTH.toFloat() / source.width, INPUT_HEIGHT.toFloat() / source.height)
@@ -2992,7 +3931,7 @@ private object PlateOcrOnnxRecognizer {
         return input
     }
 
-    // CTC 출력에서 blank와 반복 문자를 제거해 최종 번호판 문자열을 만듭니다.
+    // CTC 특성상 같은 문자가 연속 출력될 수 있어 blank와 반복 문자를 제거합니다.
     private fun decodeCtcGreedy(logits: Array<Array<FloatArray>>, charset: List<String>): String {
         val result = StringBuilder()
         var previous = BLANK_INDEX
@@ -3015,8 +3954,8 @@ private object PlateOcrOnnxRecognizer {
     }
 }
 
-// 한 글자씩 분리된 이미지에는 전체 번호판 CTC 모델 대신 단일 글자 분류 모델을 사용합니다.
-// 자리 정보를 이용해 숫자 자리에서는 숫자만, 한글 자리에서는 번호판 한글만 후보로 고릅니다.
+// 글자를 따로 잘라낸 후보는 전체 번호판 모델보다 단일 글자 분류 모델이 안정적이라 별도 경로로 읽습니다.
+// 자리 정보를 이용해 숫자/한글 후보군을 제한해 엉뚱한 문자 선택을 줄입니다.
 private object CharOcrOnnxRecognizer {
     private const val MODEL_ASSET_NAME = "char_ocr.onnx"
     private const val CHARSET_ASSET_NAME = "char_charset.txt"
@@ -3057,7 +3996,7 @@ private object CharOcrOnnxRecognizer {
         }
     }
 
-    // 학습용 단독 글자 이미지와 같은 48x48 흰 배경, 비율 유지, [-1, 1] 정규화 입력을 만듭니다.
+    // 단일 글자 모델도 학습 때와 같은 48x48 흰 배경 입력을 맞춰야 정확도가 유지됩니다.
     private fun bitmapToModelInput(bitmap: Bitmap): FloatArray {
         val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
         val scale = minOf(INPUT_SIZE.toFloat() / source.width, INPUT_SIZE.toFloat() / source.height)
@@ -3145,7 +4084,7 @@ private fun cleanRecognizedPlateText(text: String): String {
     return text.replace(Regex("[^0-9가-힣]"), "")
 }
 
-// 휴대전화는 내부적으로 숫자 11자리만 저장하고, 화면에만 010 - 1234 - 5678 형태로 보여줍니다.
+// 휴대전화 값은 숫자만 저장하고 표시 단계에서만 하이픈을 넣어 입력 검증과 화면 표시를 분리합니다.
 private object PhoneNumberVisualTransformation : VisualTransformation {
     override fun filter(text: AnnotatedString): TransformedText {
         val digits = text.text.filter { it.isDigit() }.take(11)
