@@ -59,6 +59,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -68,6 +69,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -81,6 +83,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -91,6 +94,11 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.core.content.ContextCompat
 import com.example.vehiclelicensereportapp.ui.theme.VehicleLicenseReportAppTheme
+import com.google.firebase.FirebaseApp
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Query
+import com.google.firebase.storage.FirebaseStorage
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
@@ -113,7 +121,7 @@ import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-// Android 진입점은 Compose 루트만 연결하고, 실제 화면 흐름은 PlateReportApp에서 관리합니다.
+// Android 진입점에서는 Compose 루트만 연결하고, 실제 화면 흐름은 PlateReportApp에서 관리합니다.
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -126,12 +134,24 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 신고 접수 플로우 전체의 임시 입력값과 화면 이동 상태를 한 곳에서 관리합니다.
-// 별도 Navigation 라이브러리 없이 enum으로 화면을 전환해, 촬영/확인/완료 흐름을 단순하게 유지합니다.
+// 신고 접수 플로우 전체의 임시 입력값과 화면 이동 상태를 한곳에서 관리합니다.
+// 별도 Navigation 라이브러리 없이 enum으로 화면을 전환합니다.
 @Composable
 private fun PlateReportApp() {
     val context = LocalContext.current
-    var currentScreen by remember { mutableStateOf(AppScreen.Home) }
+    val firebaseAuth = remember { getConfiguredFirebaseAuth(context) }
+    val firestore = remember { getConfiguredFirebaseFirestore(context) }
+    val storage = remember { getConfiguredFirebaseStorage(context) }
+    var signedInEmail by remember { mutableStateOf(firebaseAuth?.currentUser?.email) }
+    var userProfile by remember {
+        mutableStateOf(signedInEmail?.let { loadUserProfile(context, it) })
+    }
+    var isGuestMode by remember { mutableStateOf(false) }
+    var currentScreen by remember {
+        mutableStateOf(
+            if (signedInEmail != null || isGuestMode) AppScreen.Home else AppScreen.Login
+        )
+    }
     var selectedCategory by remember { mutableStateOf<ViolationCategory?>(null) }
     var selectedViolationType by remember { mutableStateOf("") }
     var recognizedPlate by remember { mutableStateOf("") }
@@ -140,7 +160,7 @@ private fun PlateReportApp() {
     var vehiclePhotoFileNames by remember { mutableStateOf("") }
     var reportContent by remember { mutableStateOf("") }
     var phoneNumberDigits by remember { mutableStateOf("") }
-    // 신고 완료 후 홈/신고내역 화면에 바로 반영하고, 앱을 다시 켜도 텍스트 기록은 남겨둡니다.
+    // 신고 완료 후 신고내역 화면에 바로 반영하고, 앱을 다시 켜도 기록을 유지합니다.
     var reportHistory by remember { mutableStateOf(loadReportHistory(context)) }
     var selectedHistoryReport by remember { mutableStateOf<ReportHistoryItem?>(null) }
     var hasCameraPermission by remember {
@@ -149,7 +169,7 @@ private fun PlateReportApp() {
                 PackageManager.PERMISSION_GRANTED
         )
     }
-    // 신고 완료 후 홈으로 돌아갈 때 이전 접수 정보가 다음 신고에 섞이지 않도록 초기화합니다.
+    // 신고 완료 후 홈으로 돌아가면 이전 접수 정보가 다음 신고에 섞이지 않도록 초기화합니다.
     val resetReportDraft = {
         selectedCategory = null
         selectedViolationType = ""
@@ -159,6 +179,14 @@ private fun PlateReportApp() {
         vehiclePhotoFileNames = ""
         reportContent = ""
         phoneNumberDigits = ""
+    }
+    val signOut = {
+        firebaseAuth?.signOut()
+        signedInEmail = null
+        userProfile = null
+        isGuestMode = false
+        resetReportDraft()
+        currentScreen = AppScreen.Login
     }
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -172,18 +200,90 @@ private fun PlateReportApp() {
         }
     }
 
+    LaunchedEffect(firebaseAuth?.currentUser?.uid, isGuestMode) {
+        val uid = firebaseAuth?.currentUser?.uid
+        if (!isGuestMode && uid != null) {
+            loadReportsFromFirestore(firestore, uid) { serverReports ->
+                reportHistory = serverReports
+                saveReportHistory(context, serverReports)
+            }
+        } else {
+            reportHistory = loadReportHistory(context)
+        }
+    }
+
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
         Surface(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
-            color = Color.White
+            color = appBackgroundColor
         ) {
             when (currentScreen) {
+                AppScreen.Login -> LoginScreen(
+                    firebaseConfigured = firebaseAuth != null,
+                    onGuestClick = {
+                        isGuestMode = true
+                        currentScreen = AppScreen.Home
+                    },
+                    onSignInClick = { userId, password, onComplete ->
+                        signInWithUserId(firebaseAuth, userId, password) { success, message ->
+                            if (success) {
+                                val accountEmail = firebaseAuth?.currentUser?.email ?: authEmailFromUserId(userId)
+                                signedInEmail = accountEmail
+                                userProfile = loadUserProfile(context, accountEmail) ?: UserProfile(
+                                    userId = userId.trim(),
+                                    authEmail = accountEmail
+                                )
+                                loadUserProfileFromFirestore(firestore, userId.trim()) { serverProfile ->
+                                    if (serverProfile != null) {
+                                        saveUserProfile(context, serverProfile)
+                                        userProfile = serverProfile
+                                    }
+                                }
+                                isGuestMode = false
+                                currentScreen = AppScreen.Home
+                            }
+                            onComplete(message)
+                        }
+                    },
+                    onSignUpClick = { email, password, onComplete ->
+                        currentScreen = AppScreen.SignUp
+                        onComplete(null)
+                    }
+                )
+
+                AppScreen.SignUp -> SignUpScreenV2(
+                    firebaseConfigured = firebaseAuth != null,
+                    onBackClick = { currentScreen = AppScreen.Login },
+                    onSignUpClick = { profile, password, onComplete ->
+                        val authEmail = authEmailFromUserId(profile.userId)
+                        createAccountWithEmail(firebaseAuth, authEmail, password) { success, message ->
+                            if (success) {
+                                val savedProfile = profile.copy(authEmail = firebaseAuth?.currentUser?.email ?: authEmail)
+                                saveUserProfile(context, savedProfile)
+                                saveUserProfileToFirestore(firestore, firebaseAuth?.currentUser?.uid, savedProfile) {}
+                                signedInEmail = savedProfile.authEmail
+                                userProfile = savedProfile
+                                isGuestMode = false
+                                currentScreen = AppScreen.Home
+                            }
+                            onComplete(message)
+                        }
+                    }
+                )
+
                 AppScreen.Home -> HomeScreen(
                     reports = reportHistory,
+                    profileImagePath = userProfile?.profileImagePath.orEmpty(),
                     onReportClick = { currentScreen = AppScreen.Category },
                     onHistoryClick = {
+                        firebaseAuth?.currentUser?.uid?.let { uid ->
+                            loadReportsFromFirestore(firestore, uid) { serverReports ->
+                                reportHistory = serverReports
+                                saveReportHistory(context, serverReports)
+                            }
+                        }
                         currentScreen = AppScreen.ReportHistory
                     },
                     onReportSelected = { report ->
@@ -191,9 +291,47 @@ private fun PlateReportApp() {
                         currentScreen = AppScreen.ReportHistoryDetail
                     },
                     onProfileClick = {
-                        Toast.makeText(context, "프로필 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
+                        if (!isGuestMode && signedInEmail == null) {
+                            signOut()
+                            return@HomeScreen
+                        }
+                        currentScreen = AppScreen.Profile
                     }
                 )
+
+                AppScreen.Profile -> {
+                    if (isGuestMode) {
+                        GuestProfileScreen(
+                            onBackClick = { currentScreen = AppScreen.Home },
+                            onLoginClick = {
+                                isGuestMode = false
+                                resetReportDraft()
+                                currentScreen = AppScreen.Login
+                            }
+                        )
+                    } else {
+                        ProfileScreenV2(
+                            profile = userProfile ?: UserProfile(authEmail = signedInEmail.orEmpty()),
+                            joinedAtText = formatProfileDate(firebaseAuth?.currentUser?.metadata?.creationTimestamp),
+                            firebaseConfigured = firebaseAuth != null,
+                            onBackClick = { currentScreen = AppScreen.Home },
+                            onSaveClick = { updatedProfile, onComplete ->
+                                val profileToSave = updatedProfile.copy(
+                                    authEmail = updatedProfile.authEmail.ifBlank { signedInEmail.orEmpty() }
+                                )
+                                saveUserProfile(context, profileToSave)
+                                saveUserProfileToFirestore(firestore, firebaseAuth?.currentUser?.uid, profileToSave) {}
+                                userProfile = profileToSave
+                                signedInEmail = profileToSave.authEmail
+                                onComplete("프로필이 저장되었습니다.")
+                            },
+                            onPasswordChangeClick = { newPassword, onComplete ->
+                                updateFirebasePassword(firebaseAuth, newPassword, onComplete)
+                            },
+                            onLogoutClick = signOut
+                        )
+                    }
+                }
 
                 AppScreen.Category -> ViolationCategoryScreen(
                     onBackClick = { currentScreen = AppScreen.Home },
@@ -303,10 +441,23 @@ private fun PlateReportApp() {
                             photoFileNames = vehiclePhotoFileNames,
                             status = "접수 완료"
                         )
-                        val updatedHistory = listOf(newReport) + reportHistory
-                        reportHistory = updatedHistory
-                        saveReportHistory(context, updatedHistory)
-                        currentScreen = AppScreen.ReportComplete
+                        val uid = firebaseAuth?.currentUser?.uid
+                        if (!isGuestMode && uid != null) {
+                            saveReportToFirestore(context, firestore, storage, uid, newReport) { savedReport, error ->
+                                val updatedHistory = listOf(savedReport) + reportHistory.filterNot { it.id == savedReport.id }
+                                reportHistory = updatedHistory
+                                saveReportHistory(context, updatedHistory)
+                                if (error != null) {
+                                    Toast.makeText(context, "서버 저장 실패: $error", Toast.LENGTH_SHORT).show()
+                                }
+                                currentScreen = AppScreen.ReportComplete
+                            }
+                        } else {
+                            val updatedHistory = listOf(newReport) + reportHistory
+                            reportHistory = updatedHistory
+                            saveReportHistory(context, updatedHistory)
+                            currentScreen = AppScreen.ReportComplete
+                        }
                     }
                 )
 
@@ -339,9 +490,12 @@ private fun PlateReportApp() {
     }
 }
 
-// 앱의 주요 화면 단계입니다. 신고 과정은 위에서 아래 순서로 진행되고, 일부 화면은 뒤로 이동할 수 있습니다.
+// 앱의 주요 화면 단계입니다. 신고 과정은 위에서 아래 순서로 진행하고, 일부 화면은 바로 이동할 수 있습니다.
 private enum class AppScreen {
+    Login,
+    SignUp,
     Home,
+    Profile,
     Category,
     ViolationType,
     PlateCamera,
@@ -354,14 +508,23 @@ private enum class AppScreen {
     ReportHistoryDetail
 }
 
-// 법령 카테고리별로 선택 가능한 세부 위반 유형을 묶어 홈 이후의 신고 흐름에 전달합니다.
+// 법령 카테고리별로 선택 가능한 세부 위반 유형을 묶어 이후 신고 흐름에 전달합니다.
 private data class ViolationCategory(
     val name: String,
     val description: String,
     val types: List<String>
 )
 
-// 신고 완료 시점의 스냅샷입니다. 목록 표시와 상세 화면 복원을 위해 사용자가 입력/촬영한 값을 함께 저장합니다.
+// 신고 완료 시점의 스냅샷입니다. 상세 화면 복원을 위해 사용자가 입력/촬영한 값을 함께 저장합니다.
+private data class UserProfile(
+    val userId: String = "",
+    val authEmail: String = "",
+    val email: String = "",
+    val phoneNumber: String = "",
+    val birthDate: String = "",
+    val profileImagePath: String = ""
+)
+
 private data class ReportHistoryItem(
     val id: String,
     val date: String,
@@ -375,11 +538,263 @@ private data class ReportHistoryItem(
     val content: String,
     val phoneNumber: String,
     val photoFileNames: String,
+    val photoUrls: String = "",
     val status: String
 )
 
-// 신고내역은 서버 연동 전 단계라 로컬 SharedPreferences에 JSON으로 보관합니다.
-// 사진은 파일명만 저장하고, 실제 이미지는 촬영 시 저장된 cacheDir 파일을 상세 화면에서 다시 읽습니다.
+// 신고내역은 서버 연동 전에도 로컬 SharedPreferences에 JSON으로 보관합니다.
+// 사진은 파일명만 저장하고, 실제 이미지는 촬영 때 cacheDir에 저장된 파일을 상세 화면에서 다시 읽습니다.
+private fun profileStorageKey(identifier: String): String =
+    USER_PROFILE_PREFIX + identifier.trim().lowercase(Locale.US)
+
+private fun authEmailFromUserId(userId: String): String =
+    "${userId.trim().lowercase(Locale.US)}@ai-vehicle.local"
+
+private fun loadUserProfile(context: Context, email: String): UserProfile? {
+    if (email.isBlank()) return null
+    val raw = context
+        .getSharedPreferences(USER_PROFILE_PREFS, Context.MODE_PRIVATE)
+        .getString(profileStorageKey(email), null)
+        ?: return null
+
+    return runCatching {
+        val item = JSONObject(raw)
+        UserProfile(
+            userId = item.optString("userId"),
+            authEmail = item.optString("authEmail", email),
+            email = item.optString("email"),
+            phoneNumber = item.optString("phoneNumber"),
+            birthDate = item.optString("birthDate"),
+            profileImagePath = item.optString("profileImagePath")
+        )
+    }.getOrNull()
+}
+
+private fun saveUserProfile(context: Context, profile: UserProfile) {
+    val key = profile.authEmail.ifBlank { authEmailFromUserId(profile.userId) }
+    if (key.isBlank()) return
+    val item = JSONObject()
+        .put("userId", profile.userId)
+        .put("authEmail", key)
+        .put("email", profile.email.trim())
+        .put("phoneNumber", profile.phoneNumber)
+        .put("birthDate", profile.birthDate)
+        .put("profileImagePath", profile.profileImagePath)
+
+    context
+        .getSharedPreferences(USER_PROFILE_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(profileStorageKey(key), item.toString())
+        .apply()
+}
+
+private fun saveProfileImage(context: Context, uri: Uri, email: String): String? {
+    if (email.isBlank()) return null
+    val directory = File(context.filesDir, "profile_images").apply { mkdirs() }
+    val file = File(directory, profileStorageKey(email) + ".jpg")
+    return runCatching {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            file.outputStream().use { output -> input.copyTo(output) }
+        } ?: return null
+        file.absolutePath
+    }.getOrNull()
+}
+
+private fun formatProfileDate(millis: Long?): String {
+    if (millis == null || millis <= 0L) return "정보 없음"
+    return SimpleDateFormat("yyyy.MM.dd", Locale.KOREA).format(millis)
+}
+
+private fun loadUserProfileFromFirestore(
+    firestore: FirebaseFirestore?,
+    userId: String,
+    onResult: (UserProfile?) -> Unit
+) {
+    val trimmedUserId = userId.trim()
+    if (firestore == null || trimmedUserId.isBlank()) {
+        onResult(null)
+        return
+    }
+
+    firestore.collection("user_profiles")
+        .document(trimmedUserId)
+        .get()
+        .addOnSuccessListener { document ->
+            if (!document.exists()) {
+                onResult(null)
+            } else {
+                onResult(
+                    UserProfile(
+                        userId = document.getString("userId").orEmpty(),
+                        authEmail = document.getString("authEmail").orEmpty(),
+                        email = document.getString("email").orEmpty(),
+                        phoneNumber = document.getString("phoneNumber").orEmpty(),
+                        birthDate = document.getString("birthDate").orEmpty(),
+                        profileImagePath = document.getString("profileImagePath").orEmpty()
+                    )
+                )
+            }
+        }
+        .addOnFailureListener { onResult(null) }
+}
+
+private fun saveUserProfileToFirestore(
+    firestore: FirebaseFirestore?,
+    uid: String?,
+    profile: UserProfile,
+    onComplete: (String?) -> Unit
+) {
+    if (firestore == null || uid.isNullOrBlank() || profile.userId.isBlank()) {
+        onComplete(null)
+        return
+    }
+    val authEmail = profile.authEmail.ifBlank { authEmailFromUserId(profile.userId) }
+    val data = mapOf(
+        "uid" to uid,
+        "userId" to profile.userId,
+        "authEmail" to authEmail,
+        "email" to profile.email,
+        "phoneNumber" to profile.phoneNumber,
+        "birthDate" to profile.birthDate,
+        "profileImagePath" to profile.profileImagePath,
+        "updatedAt" to System.currentTimeMillis()
+    )
+    firestore.collection("user_profiles")
+        .document(profile.userId)
+        .set(data)
+        .addOnSuccessListener { onComplete(null) }
+        .addOnFailureListener { error -> onComplete(error.localizedMessage) }
+}
+
+private fun reportToMap(report: ReportHistoryItem, uid: String): Map<String, Any> {
+    return mapOf(
+        "id" to report.id,
+        "uid" to uid,
+        "date" to report.date,
+        "time" to report.time,
+        "year" to report.year,
+        "month" to report.month,
+        "reportedAtMillis" to report.reportedAtMillis,
+        "categoryName" to report.categoryName,
+        "violationType" to report.violationType,
+        "plate" to report.plate,
+        "content" to report.content,
+        "phoneNumber" to report.phoneNumber,
+        "photoFileNames" to report.photoFileNames,
+        "photoUrls" to report.photoUrls,
+        "status" to report.status
+    )
+}
+
+private fun reportFromMap(id: String, data: Map<String, Any>): ReportHistoryItem {
+    return ReportHistoryItem(
+        id = (data["id"] as? String).orEmpty().ifBlank { id },
+        date = (data["date"] as? String).orEmpty(),
+        time = (data["time"] as? String).orEmpty(),
+        year = (data["year"] as? Number)?.toInt() ?: 0,
+        month = (data["month"] as? Number)?.toInt() ?: 0,
+        reportedAtMillis = (data["reportedAtMillis"] as? Number)?.toLong() ?: 0L,
+        categoryName = (data["categoryName"] as? String).orEmpty(),
+        violationType = (data["violationType"] as? String).orEmpty(),
+        plate = (data["plate"] as? String).orEmpty(),
+        content = (data["content"] as? String).orEmpty(),
+        phoneNumber = (data["phoneNumber"] as? String).orEmpty(),
+        photoFileNames = (data["photoFileNames"] as? String).orEmpty(),
+        photoUrls = (data["photoUrls"] as? String).orEmpty(),
+        status = (data["status"] as? String).orEmpty()
+    )
+}
+
+private fun loadReportsFromFirestore(
+    firestore: FirebaseFirestore?,
+    uid: String,
+    onResult: (List<ReportHistoryItem>) -> Unit
+) {
+    if (firestore == null || uid.isBlank()) {
+        onResult(emptyList())
+        return
+    }
+    firestore.collection("users")
+        .document(uid)
+        .collection("reports")
+        .orderBy("reportedAtMillis", Query.Direction.DESCENDING)
+        .get()
+        .addOnSuccessListener { snapshot ->
+            onResult(snapshot.documents.map { reportFromMap(it.id, it.data.orEmpty()) })
+        }
+        .addOnFailureListener { onResult(emptyList()) }
+}
+
+private fun saveReportToFirestore(
+    context: Context,
+    firestore: FirebaseFirestore?,
+    storage: FirebaseStorage?,
+    uid: String?,
+    report: ReportHistoryItem,
+    onComplete: (ReportHistoryItem, String?) -> Unit
+) {
+    if (firestore == null || uid.isNullOrBlank()) {
+        onComplete(report, "서버 저장을 위해 로그인이 필요합니다.")
+        return
+    }
+
+    uploadReportPhotos(context, storage, uid, report) { photoUrls ->
+        val serverReport = report.copy(photoUrls = photoUrls.joinToString(","))
+        firestore.collection("users")
+            .document(uid)
+            .collection("reports")
+            .document(serverReport.id)
+            .set(reportToMap(serverReport, uid))
+            .addOnSuccessListener { onComplete(serverReport, null) }
+            .addOnFailureListener { error -> onComplete(serverReport, error.localizedMessage) }
+    }
+}
+
+private fun uploadReportPhotos(
+    context: Context,
+    storage: FirebaseStorage?,
+    uid: String,
+    report: ReportHistoryItem,
+    onComplete: (List<String>) -> Unit
+) {
+    val fileNames = report.photoFileNames
+        .split(",")
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+    if (storage == null || fileNames.isEmpty()) {
+        onComplete(emptyList())
+        return
+    }
+
+    val urls = mutableListOf<String>()
+    fun uploadAt(index: Int) {
+        if (index >= fileNames.size) {
+            onComplete(urls)
+            return
+        }
+        val file = File(context.cacheDir, fileNames[index])
+        if (!file.exists()) {
+            uploadAt(index + 1)
+            return
+        }
+        val ref = storage.reference
+            .child("reports")
+            .child(uid)
+            .child(report.id)
+            .child(file.name)
+        ref.putFile(Uri.fromFile(file))
+            .continueWithTask { ref.downloadUrl }
+            .addOnSuccessListener { uri ->
+                urls.add(uri.toString())
+                uploadAt(index + 1)
+            }
+            .addOnFailureListener {
+                uploadAt(index + 1)
+            }
+    }
+    uploadAt(0)
+}
+
 private fun loadReportHistory(context: Context): List<ReportHistoryItem> {
     val raw = context
         .getSharedPreferences(REPORT_HISTORY_PREFS, Context.MODE_PRIVATE)
@@ -402,6 +817,7 @@ private fun loadReportHistory(context: Context): List<ReportHistoryItem> {
                 content = item.optString("content"),
                 phoneNumber = item.optString("phoneNumber"),
                 photoFileNames = item.optString("photoFileNames"),
+                photoUrls = item.optString("photoUrls"),
                 status = item.optString("status")
             )
         }
@@ -425,6 +841,7 @@ private fun saveReportHistory(context: Context, reports: List<ReportHistoryItem>
                 .put("content", report.content)
                 .put("phoneNumber", report.phoneNumber)
                 .put("photoFileNames", report.photoFileNames)
+                .put("photoUrls", report.photoUrls)
                 .put("status", report.status)
         )
     }
@@ -435,7 +852,7 @@ private fun saveReportHistory(context: Context, reports: List<ReportHistoryItem>
         .apply()
 }
 
-// 사용자에게 먼저 법령 기준을 고르게 하고, 다음 화면에서 해당 법령의 세부 유형만 보여줍니다.
+// 사용자가 먼저 법령 기준을 고르고, 다음 화면에서 해당 법령의 위반 유형만 보게 합니다.
 private val violationCategories = listOf(
     ViolationCategory(
         name = "도로교통법",
@@ -453,7 +870,7 @@ private val violationCategories = listOf(
         types = listOf("소방차 전용구역")
     ),
     ViolationCategory(
-        name = "친환경 자동차법",
+        name = "친환경자동차법",
         description = "친환경차 충전 방해 신고 유형",
         types = listOf("친환경차 충전구역")
     )
@@ -461,24 +878,31 @@ private val violationCategories = listOf(
 
 // 홈 메뉴와 법령 카테고리 카드가 같은 시각 언어를 갖도록 공통 그라데이션 팔레트를 사용합니다.
 private val tileGradients = listOf(
-    listOf(Color(0xFF5ED477), Color(0xFF27C4B2)),
-    listOf(Color(0xFF31CBB2), Color(0xFF2AC8C8)),
-    listOf(Color(0xFF17B7D5), Color(0xFF25C4D8)),
-    listOf(Color(0xFF43A7E7), Color(0xFF438FE2)),
-    listOf(Color(0xFF4E73E8), Color(0xFF4367DF)),
-    listOf(Color(0xFF426FE2), Color(0xFF3F62D8))
+    listOf(Color(0xFF3B82F6), Color(0xFF2563EB)),
+    listOf(Color(0xFF10B981), Color(0xFF0D9488)),
+    listOf(Color(0xFF8B5CF6), Color(0xFF6366F1)),
+    listOf(Color(0xFFF59E0B), Color(0xFFF97316)),
+    listOf(Color(0xFFEC4899), Color(0xFFDB2777)),
+    listOf(Color(0xFF06B6D4), Color(0xFF0891B2))
 )
 
-// 주요 버튼/제목/본문에 반복되는 색상입니다. 화면 간 톤이 흔들리지 않도록 한 곳에서 관리합니다.
-private val primaryButtonColor = Color(0xFF456AE3)
-private val headingColor = Color(0xFF202638)
-private val bodyTextColor = Color(0xFF6D7485)
+// 주요 버튼, 제목, 본문에 반복되는 색상입니다. 화면마다 색이 흔들리지 않도록 한곳에서 관리합니다.
+private val appBackgroundColor = Color(0xFFF8FAFC)
+private val appCardColor = Color.White
+private val appMutedColor = Color(0xFFF1F5F9)
+private val appBorderColor = Color(0xFFE2E8F0)
+private val appAccentColor = Color(0xFFDBEAFE)
+private val primaryButtonColor = Color(0xFF3B82F6)
+private val headingColor = Color(0xFF0F172A)
+private val bodyTextColor = Color(0xFF64748B)
 private const val REPORT_HISTORY_PREFS = "report_history_prefs"
 private const val REPORT_HISTORY_ITEMS = "report_history_items"
 private const val REPORT_HISTORY_PAGE_SIZE = 7
+private const val USER_PROFILE_PREFS = "user_profile_prefs"
+private const val USER_PROFILE_PREFIX = "user_profile_"
 
-// 촬영 가이드와 실제 crop 계산이 같은 비율을 쓰도록 기준값을 공유합니다.
-// 국내 번호판의 긴 가로형 비율을 기준으로 잡되, 실제 사진 왜곡을 고려해 후보 탐색 범위는 넓게 둡니다.
+// 촬영 가이드는 실제 crop 계산과 같은 비율을 쓰도록 기준값을 공유합니다.
+// 국내 번호판의 긴 가로형 비율을 기준으로 하되, 실제 사진 왜곡을 고려해 후보 탐색 범위를 넓게 둡니다.
 private const val PLATE_GUIDE_WIDTH_RATIO = 0.82f
 private const val PLATE_GUIDE_HEIGHT_RATIO = 0.14f
 private const val PLATE_GUIDE_TOP_RATIO = 0.38f
@@ -489,10 +913,1441 @@ private const val OFFICIAL_PLATE_ASPECT_MIN = 2.75f
 private const val OFFICIAL_PLATE_ASPECT_MAX = 7.35f
 private val CAMERA_CAPTURE_RESOLUTION = Size(1920, 1080)
 
-// 홈에서는 신고 시작 동선을 가장 크게 두고, 최근 3개월 기록을 함께 보여줘 접수 결과로 자연스럽게 돌아오게 합니다.
+private fun getConfiguredFirebaseAuth(context: Context): FirebaseAuth? {
+    return runCatching {
+        if (FirebaseApp.getApps(context).isEmpty()) {
+            FirebaseApp.initializeApp(context)
+        }
+        if (FirebaseApp.getApps(context).isEmpty()) {
+            null
+        } else {
+            FirebaseAuth.getInstance()
+        }
+    }.getOrNull()
+}
+
+private fun getConfiguredFirebaseFirestore(context: Context): FirebaseFirestore? {
+    return runCatching {
+        if (FirebaseApp.getApps(context).isEmpty()) {
+            FirebaseApp.initializeApp(context)
+        }
+        if (FirebaseApp.getApps(context).isEmpty()) null else FirebaseFirestore.getInstance()
+    }.getOrNull()
+}
+
+private fun getConfiguredFirebaseStorage(context: Context): FirebaseStorage? {
+    return runCatching {
+        if (FirebaseApp.getApps(context).isEmpty()) {
+            FirebaseApp.initializeApp(context)
+        }
+        if (FirebaseApp.getApps(context).isEmpty()) null else FirebaseStorage.getInstance()
+    }.getOrNull()
+}
+
+private fun signInWithUserId(
+    auth: FirebaseAuth?,
+    userId: String,
+    password: String,
+    onResult: (Boolean, String?) -> Unit
+) {
+    val trimmedUserId = userId.trim()
+    if (trimmedUserId.isBlank()) {
+        onResult(false, "아이디를 입력해주세요.")
+        return
+    }
+    signInWithEmail(auth, authEmailFromUserId(trimmedUserId), password, onResult)
+}
+
+private fun signInWithEmail(
+    auth: FirebaseAuth?,
+    email: String,
+    password: String,
+    onResult: (Boolean, String?) -> Unit
+) {
+    val trimmedEmail = email.trim()
+    if (auth == null) {
+        onResult(false, "Firebase 설정 파일이 없습니다. app/google-services.json을 추가해주세요.")
+        return
+    }
+    if (trimmedEmail.isBlank() || password.isBlank()) {
+        onResult(false, "아이디와 비밀번호를 입력해주세요.")
+        return
+    }
+
+    auth.signInWithEmailAndPassword(trimmedEmail, password)
+        .addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                onResult(true, null)
+            } else {
+                onResult(false, task.exception?.localizedMessage ?: "로그인에 실패했습니다.")
+            }
+        }
+}
+
+private fun createAccountWithEmail(
+    auth: FirebaseAuth?,
+    email: String,
+    password: String,
+    onResult: (Boolean, String?) -> Unit
+) {
+    val trimmedEmail = email.trim()
+    if (auth == null) {
+        onResult(false, "Firebase 설정 파일이 없습니다. app/google-services.json을 추가해주세요.")
+        return
+    }
+    if (trimmedEmail.isBlank() || password.length < 6) {
+        onResult(false, "아이디와 6자리 이상의 비밀번호를 입력해주세요.")
+        return
+    }
+
+    auth.createUserWithEmailAndPassword(trimmedEmail, password)
+        .addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                onResult(true, null)
+            } else {
+                onResult(false, task.exception?.localizedMessage ?: "회원가입에 실패했습니다.")
+            }
+        }
+}
+
+private fun updateFirebasePassword(
+    auth: FirebaseAuth?,
+    password: String,
+    onResult: (String?) -> Unit
+) {
+    val user = auth?.currentUser
+    if (user == null) {
+        onResult("로그인된 계정이 없습니다.")
+        return
+    }
+    if (password.length !in 6..12) {
+        onResult("새 비밀번호는 6~12자리로 입력해주세요.")
+        return
+    }
+
+    user.updatePassword(password)
+        .addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                onResult("비밀번호가 변경되었습니다.")
+            } else {
+                onResult(task.exception?.localizedMessage ?: "비밀번호 변경에 실패했습니다. 다시 로그인한 뒤 시도해주세요.")
+            }
+        }
+}
+
+@Composable
+private fun LoginScreen(
+    firebaseConfigured: Boolean,
+    onGuestClick: () -> Unit,
+    onSignInClick: (String, String, (String?) -> Unit) -> Unit,
+    onSignUpClick: (String, String, (String?) -> Unit) -> Unit
+) {
+    var userId by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Spacer(modifier = Modifier.height(54.dp))
+        Text(
+            text = "로그인",
+            fontSize = 34.sp,
+            lineHeight = 40.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "신고 내역과 사진 업로드를 사용자 계정에 연결합니다.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        if (!firebaseConfigured) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF6E5))
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "Firebase 설정 필요",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = headingColor
+                    )
+                    Text(
+                        text = "Firebase Console에서 Android 앱을 등록하고 app/google-services.json 파일을 추가하면 실제 로그인이 활성화됩니다.",
+                        fontSize = 13.sp,
+                        lineHeight = 19.sp,
+                        color = bodyTextColor
+                    )
+                }
+            }
+        }
+
+        OutlinedTextField(
+            value = userId,
+            onValueChange = { userId = it.trim().take(12) },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("가입한 아이디를 입력해주세요") },
+            label = { Text("아이디") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text)
+        )
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("비밀번호") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+        )
+
+        message?.let {
+            Text(
+                text = it,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = Color(0xFFB3261E)
+            )
+        }
+
+        Button(
+            onClick = {
+                isLoading = true
+                message = null
+                onSignInClick(userId, password) { resultMessage ->
+                    isLoading = false
+                    message = resultMessage
+                }
+            },
+            enabled = firebaseConfigured && !isLoading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(58.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+        ) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = Color.White
+                )
+            } else {
+                Text(
+                    text = "로그인",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                isLoading = true
+                message = null
+                onSignUpClick(userId, password) { resultMessage ->
+                    isLoading = false
+                    message = resultMessage
+                }
+            },
+            enabled = firebaseConfigured && !isLoading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEEF3FF))
+        ) {
+            Text(
+                text = "회원가입",
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                color = primaryButtonColor
+            )
+        }
+
+        TextButton(
+            onClick = onGuestClick,
+            enabled = !isLoading,
+            modifier = Modifier
+        ) {
+            Text("비회원으로 계속", color = bodyTextColor, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+// 홈에서는 신고 시작 동선을 크게 열고, 최근 3개월 기록을 함께 보여주어 접수 결과로 자연스럽게 돌아오게 합니다.
+@Composable
+private fun GuestProfileScreen(
+    onBackClick: () -> Unit,
+    onLoginClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Spacer(modifier = Modifier.height(18.dp))
+        ProfileHomeButton(onClick = onBackClick)
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "프로필",
+            fontSize = 34.sp,
+            lineHeight = 40.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "계정 정보와 프로필 이미지를 관리합니다.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(18.dp))
+        Box(
+            modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(128.dp)
+                    .clip(CircleShape)
+                    .background(appMutedColor)
+                    .border(3.dp, appBorderColor, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Canvas(modifier = Modifier.size(82.dp)) {
+                    val strokeWidth = 7.dp.toPx()
+                    drawCircle(
+                        color = headingColor,
+                        radius = size.minDimension * 0.22f,
+                        center = Offset(size.width / 2f, size.height * 0.32f),
+                        style = Stroke(width = strokeWidth)
+                    )
+                    drawArc(
+                        color = headingColor,
+                        startAngle = 205f,
+                        sweepAngle = 130f,
+                        useCenter = false,
+                        topLeft = Offset(size.width * 0.14f, size.height * 0.44f),
+                        size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.52f),
+                        style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = "비회원입니다.",
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center,
+            fontSize = 22.sp,
+            lineHeight = 28.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "비회원은 일부 기능이 제한됩니다.\n로그인을 하여 앱을 사용해주세요.",
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp),
+            textAlign = TextAlign.Center,
+            fontSize = 16.sp,
+            lineHeight = 25.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.weight(1f))
+        Button(
+            onClick = onLoginClick,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+        ) {
+            Text(
+                text = "로그인",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+        }
+        Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun ProfileScreenV2(
+    profile: UserProfile,
+    joinedAtText: String,
+    firebaseConfigured: Boolean,
+    onBackClick: () -> Unit,
+    onSaveClick: (UserProfile, (String?) -> Unit) -> Unit,
+    onPasswordChangeClick: (String, (String?) -> Unit) -> Unit,
+    onLogoutClick: () -> Unit
+) {
+    val context = LocalContext.current
+    var userId by remember(profile.email, profile.userId) { mutableStateOf(profile.userId) }
+    var phoneNumber by remember(profile.email, profile.phoneNumber) { mutableStateOf(profile.phoneNumber) }
+    var birthDate by remember(profile.email, profile.birthDate) { mutableStateOf(profile.birthDate) }
+    var profileImagePath by remember(profile.email, profile.profileImagePath) {
+        mutableStateOf(profile.profileImagePath)
+    }
+    var isEditing by remember { mutableStateOf(false) }
+    var showPasswordChange by remember { mutableStateOf(false) }
+    var newPassword by remember { mutableStateOf("") }
+    var newPasswordConfirm by remember { mutableStateOf("") }
+    var isSaving by remember { mutableStateOf(false) }
+    var isChangingPassword by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    val profileBitmap = remember(profileImagePath) {
+        profileImagePath.takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(it) }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            val savedPath = saveProfileImage(context, uri, profile.authEmail.ifBlank { profile.email })
+            if (savedPath != null) {
+                profileImagePath = savedPath
+                message = "이미지를 선택했습니다. 저장하기를 누르면 반영됩니다."
+                isEditing = true
+            } else {
+                message = "이미지를 불러오지 못했습니다."
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Spacer(modifier = Modifier.height(4.dp))
+        ProfileHomeButton(onClick = onBackClick)
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            text = "프로필",
+            fontSize = 28.sp,
+            lineHeight = 32.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "계정 정보와 프로필 이미지를 관리합니다.",
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 2.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(92.dp)
+                    .clip(CircleShape)
+                    .background(appMutedColor)
+                    .border(2.dp, appBorderColor, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                if (profileBitmap != null) {
+                    Image(
+                        bitmap = profileBitmap.asImageBitmap(),
+                        contentDescription = "프로필 이미지",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(CircleShape),
+                        contentScale = ContentScale.Crop
+                    )
+                } else {
+                    Canvas(modifier = Modifier.size(58.dp)) {
+                        val strokeWidth = 5.dp.toPx()
+                        drawCircle(
+                            color = headingColor,
+                            radius = size.minDimension * 0.22f,
+                            center = Offset(size.width / 2f, size.height * 0.32f),
+                            style = Stroke(width = strokeWidth)
+                        )
+                        drawArc(
+                            color = headingColor,
+                            startAngle = 205f,
+                            sweepAngle = 130f,
+                            useCenter = false,
+                            topLeft = Offset(size.width * 0.14f, size.height * 0.44f),
+                            size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.52f),
+                            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                        )
+                    }
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = { imagePicker.launch("image/*") },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(36.dp),
+                shape = RoundedCornerShape(6.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color.White)
+            ) {
+                Text("이미지 선택", color = headingColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            Button(
+                onClick = {
+                    profileImagePath = ""
+                    isEditing = true
+                    message = "프로필 이미지를 제거했습니다. 저장하기를 누르면 반영됩니다."
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(36.dp),
+                shape = RoundedCornerShape(6.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E40AF))
+            ) {
+                Text("이미지 제거", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 2.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp)
+        ) {
+            ProfileInfoRow("아이디", userId.ifBlank { "미입력" })
+            ProfileInfoRow("이메일", profile.email.ifBlank { "미입력" })
+            ProfileInfoRow("가입일", joinedAtText)
+            ProfileInfoRow("전화번호", phoneNumber.ifBlank { "미입력" })
+            ProfileInfoRow("생년월일", birthDate.ifBlank { "미입력" })
+        }
+
+        message?.let {
+            Text(
+                text = it,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = if (it.contains("저장") || it.contains("변경")) primaryButtonColor else Color(0xFFB3261E)
+            )
+        }
+
+        Button(
+            onClick = {
+                isEditing = !isEditing
+                showPasswordChange = false
+                message = null
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+        ) {
+            Text(if (isEditing) "수정 닫기" else "정보 수정", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        }
+
+        if (isEditing) {
+            OutlinedTextField(
+                value = userId,
+                onValueChange = { userId = it.trim().take(12) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("아이디", color = Color.Black) },
+                placeholder = { Text("5~12자리 글자를 입력해주세요") },
+                singleLine = true,
+                enabled = !isSaving,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors()
+            )
+            OutlinedTextField(
+                value = phoneNumber,
+                onValueChange = { phoneNumber = it.filter { char -> char.isDigit() }.take(11) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("전화번호", color = Color.Black) },
+                placeholder = { Text("10~11자리 숫자를 입력해주세요") },
+                singleLine = true,
+                enabled = !isSaving,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                visualTransformation = PhoneNumberVisualTransformation
+            )
+            OutlinedTextField(
+                value = birthDate,
+                onValueChange = { birthDate = it.filter { char -> char.isDigit() }.take(8) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("생년월일", color = Color.Black) },
+                placeholder = { Text("8자리 숫자를 입력해주세요") },
+                singleLine = true,
+                enabled = !isSaving,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+            )
+            Button(
+                onClick = {
+                    when {
+                        userId.length !in 5..12 -> message = "아이디는 5자리에서 12자리로 입력해주세요."
+                        phoneNumber.length < 10 -> message = "전화번호를 10~11자리로 입력해주세요."
+                        birthDate.length != 8 -> message = "생년월일 8자리를 입력해주세요."
+                        else -> {
+                            isSaving = true
+                            onSaveClick(
+                                profile.copy(
+                                    userId = userId,
+                                    phoneNumber = phoneNumber,
+                                    birthDate = birthDate,
+                                    profileImagePath = profileImagePath
+                                )
+                            ) { resultMessage ->
+                                isSaving = false
+                                isEditing = false
+                                message = resultMessage
+                            }
+                        }
+                    }
+                },
+                enabled = !isSaving,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+            ) {
+                if (isSaving) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
+                } else {
+                    Text("저장하기", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            }
+        }
+
+        Button(
+            onClick = {
+                showPasswordChange = !showPasswordChange
+                isEditing = false
+                message = null
+            },
+            enabled = firebaseConfigured && !isChangingPassword,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = appAccentColor)
+        ) {
+            Text("비밀번호 변경", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = primaryButtonColor)
+        }
+
+        if (showPasswordChange) {
+            OutlinedTextField(
+                value = newPassword,
+                onValueChange = { newPassword = it.take(12) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("새 비밀번호", color = Color.Black) },
+                placeholder = { Text("6~12자리 글자를 입력해주세요") },
+                singleLine = true,
+                enabled = !isChangingPassword,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors(),
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            OutlinedTextField(
+                value = newPasswordConfirm,
+                onValueChange = { newPasswordConfirm = it.take(12) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("새 비밀번호 확인", color = Color.Black) },
+                placeholder = { Text("6~12자리 글자를 다시 입력해주세요") },
+                singleLine = true,
+                enabled = !isChangingPassword,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors(),
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            Button(
+                onClick = {
+                    when {
+                        newPassword.length !in 6..12 -> message = "새 비밀번호는 6자리에서 12자리로 입력해주세요."
+                        newPassword != newPasswordConfirm -> message = "새 비밀번호가 서로 다릅니다."
+                        else -> {
+                            isChangingPassword = true
+                            onPasswordChangeClick(newPassword) { resultMessage ->
+                                isChangingPassword = false
+                                message = resultMessage
+                                if (resultMessage != null) {
+                                    newPassword = ""
+                                    newPasswordConfirm = ""
+                                    showPasswordChange = false
+                                }
+                            }
+                        }
+                    }
+                },
+                enabled = !isChangingPassword,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+            ) {
+                if (isChangingPassword) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
+                } else {
+                    Text("변경하기", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            }
+        }
+
+        Button(
+            onClick = onLogoutClick,
+            enabled = !isSaving && !isChangingPassword,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(42.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = appMutedColor)
+        ) {
+            Text("로그아웃", color = bodyTextColor, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun ProfileHomeButton(onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(32.dp)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(modifier = Modifier.size(23.dp)) {
+            val strokeWidth = 3.dp.toPx()
+            val color = headingColor
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.10f, size.height * 0.48f),
+                end = Offset(size.width * 0.50f, size.height * 0.12f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.50f, size.height * 0.12f),
+                end = Offset(size.width * 0.90f, size.height * 0.48f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.22f, size.height * 0.44f),
+                end = Offset(size.width * 0.22f, size.height * 0.88f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.78f, size.height * 0.44f),
+                end = Offset(size.width * 0.78f, size.height * 0.88f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.22f, size.height * 0.88f),
+                end = Offset(size.width * 0.38f, size.height * 0.88f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.62f, size.height * 0.88f),
+                end = Offset(size.width * 0.78f, size.height * 0.88f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.38f, size.height * 0.88f),
+                end = Offset(size.width * 0.38f, size.height * 0.66f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.62f, size.height * 0.66f),
+                end = Offset(size.width * 0.62f, size.height * 0.88f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.38f, size.height * 0.66f),
+                end = Offset(size.width * 0.62f, size.height * 0.66f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProfileInfoRow(label: String, value: String) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = label,
+                modifier = Modifier.weight(0.34f),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                color = primaryButtonColor
+            )
+            Text(
+                text = value,
+                modifier = Modifier.weight(0.66f),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                color = headingColor
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(appBorderColor)
+        )
+    }
+}
+
+@Composable
+private fun ProfileScreen(
+    profile: UserProfile,
+    firebaseConfigured: Boolean,
+    onBackClick: () -> Unit,
+    onSaveClick: (UserProfile, (String?) -> Unit) -> Unit,
+    onPasswordChangeClick: (String, (String?) -> Unit) -> Unit
+) {
+    var userId by remember(profile.email) { mutableStateOf(profile.userId) }
+    var phoneNumber by remember(profile.email) { mutableStateOf(profile.phoneNumber) }
+    var birthDate by remember(profile.email) { mutableStateOf(profile.birthDate) }
+    var newPassword by remember { mutableStateOf("") }
+    var newPasswordConfirm by remember { mutableStateOf("") }
+    var showPasswordChange by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
+    var isChangingPassword by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Spacer(modifier = Modifier.height(42.dp))
+        Text(
+            text = "프로필",
+            fontSize = 34.sp,
+            lineHeight = 40.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "가입할 때 입력한 정보를 확인하고 수정할 수 있습니다.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        OutlinedTextField(
+            value = userId,
+            onValueChange = { userId = it.trim().take(12) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("아이디", color = Color.Black) },
+            placeholder = { Text("5~12자리 글자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isSaving,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors()
+        )
+        OutlinedTextField(
+            value = profile.email,
+            onValueChange = {},
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("이메일", color = Color.Black) },
+            singleLine = true,
+            readOnly = true,
+            enabled = !isSaving,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors()
+        )
+        OutlinedTextField(
+            value = phoneNumber,
+            onValueChange = { phoneNumber = it.filter { char -> char.isDigit() }.take(11) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("전화번호", color = Color.Black) },
+            placeholder = { Text("10~11자리 숫자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isSaving,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+            visualTransformation = PhoneNumberVisualTransformation
+        )
+        OutlinedTextField(
+            value = birthDate,
+            onValueChange = { birthDate = it.filter { char -> char.isDigit() }.take(8) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("생년월일", color = Color.Black) },
+            placeholder = { Text("8자리 숫자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isSaving,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+        )
+
+        message?.let {
+            Text(
+                text = it,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = if (it.contains("되었습니다")) primaryButtonColor else Color(0xFFB3261E)
+            )
+        }
+
+        Button(
+            onClick = {
+                when {
+                    userId.length !in 5..12 -> message = "아이디는 5자리에서 12자리로 입력해주세요."
+                    phoneNumber.length < 10 -> message = "전화번호를 10~11자리로 입력해주세요."
+                    birthDate.length != 8 -> message = "생년월일 8자리를 입력해주세요."
+                    else -> {
+                        isSaving = true
+                        onSaveClick(
+                            profile.copy(
+                                userId = userId,
+                                phoneNumber = phoneNumber,
+                                birthDate = birthDate
+                            )
+                        ) { resultMessage ->
+                            isSaving = false
+                            message = resultMessage
+                        }
+                    }
+                }
+            },
+            enabled = !isSaving,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(58.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+        ) {
+            Text("저장하기", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        }
+
+        Button(
+            onClick = {
+                showPasswordChange = !showPasswordChange
+                message = null
+            },
+            enabled = firebaseConfigured && !isChangingPassword,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(58.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = appAccentColor)
+        ) {
+            Text("비밀번호 변경", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = primaryButtonColor)
+        }
+
+        if (showPasswordChange) {
+            OutlinedTextField(
+                value = newPassword,
+                onValueChange = { newPassword = it.take(12) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("새 비밀번호", color = Color.Black) },
+                placeholder = { Text("6~12자리 글자를 입력해주세요") },
+                singleLine = true,
+                enabled = !isChangingPassword,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors(),
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            OutlinedTextField(
+                value = newPasswordConfirm,
+                onValueChange = { newPasswordConfirm = it.take(12) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("새 비밀번호 확인", color = Color.Black) },
+                placeholder = { Text("6~12자리 글자를 다시 입력해주세요") },
+                singleLine = true,
+                enabled = !isChangingPassword,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = loginTextFieldColors(),
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            Button(
+                onClick = {
+                    when {
+                        newPassword.length !in 6..12 -> message = "새 비밀번호는 6자리에서 12자리로 입력해주세요."
+                        newPassword != newPasswordConfirm -> message = "새 비밀번호가 서로 다릅니다."
+                        else -> {
+                            isChangingPassword = true
+                            onPasswordChangeClick(newPassword) { resultMessage ->
+                                isChangingPassword = false
+                                message = resultMessage
+                                if (resultMessage?.contains("되었습니다") == true) {
+                                    newPassword = ""
+                                    newPasswordConfirm = ""
+                                    showPasswordChange = false
+                                }
+                            }
+                        }
+                    }
+                },
+                enabled = !isChangingPassword,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+            ) {
+                if (isChangingPassword) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White
+                    )
+                } else {
+                    Text("변경하기", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            }
+        }
+
+        TextButton(
+            onClick = onBackClick,
+            enabled = !isSaving && !isChangingPassword,
+            modifier = Modifier.align(Alignment.CenterHorizontally)
+        ) {
+            Text("홈으로 돌아가기", color = bodyTextColor, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun SignUpScreenV2(
+    firebaseConfigured: Boolean,
+    onBackClick: () -> Unit,
+    onSignUpClick: (UserProfile, String, (String?) -> Unit) -> Unit
+) {
+    var userId by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var passwordConfirm by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
+    var phoneNumber by remember { mutableStateOf("") }
+    var birthDate by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Spacer(modifier = Modifier.height(42.dp))
+        Text(
+            text = "회원가입",
+            fontSize = 34.sp,
+            lineHeight = 40.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "형식에 맞게 알맞은 정보를 입력해주세요.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        OutlinedTextField(
+            value = userId,
+            onValueChange = { userId = it.trim().take(12) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("아이디", color = Color.Black) },
+            placeholder = { Text("5~12자리 글자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors()
+        )
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it.take(12) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("비밀번호", color = Color.Black) },
+            placeholder = { Text("6~12자리 글자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+        )
+        OutlinedTextField(
+            value = passwordConfirm,
+            onValueChange = { passwordConfirm = it.take(12) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("비밀번호 확인", color = Color.Black) },
+            placeholder = { Text("6~12자리 글자를 다시 입력해주세요") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+        )
+        OutlinedTextField(
+            value = email,
+            onValueChange = { email = it.take(30) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("이메일", color = Color.Black) },
+            placeholder = { Text("30자리 이내 이메일을 입력해주세요") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email)
+        )
+        OutlinedTextField(
+            value = phoneNumber,
+            onValueChange = { phoneNumber = it.filter { char -> char.isDigit() }.take(11) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("전화번호", color = Color.Black) },
+            placeholder = { Text("10~11자리 숫자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+            visualTransformation = PhoneNumberVisualTransformation
+        )
+        OutlinedTextField(
+            value = birthDate,
+            onValueChange = { birthDate = it.filter { char -> char.isDigit() }.take(8) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("생년월일", color = Color.Black) },
+            placeholder = { Text("8자리 숫자를 입력해주세요") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+        )
+
+        message?.let {
+            Text(
+                text = it,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = Color(0xFFB3261E)
+            )
+        }
+
+        Button(
+            onClick = {
+                when {
+                    userId.length !in 5..12 -> message = "아이디는 5자리에서 12자리로 입력해주세요."
+                    password.length !in 6..12 -> message = "비밀번호는 6자리에서 12자리로 입력해주세요."
+                    passwordConfirm.length !in 6..12 -> message = "비밀번호 확인은 6자리에서 12자리로 입력해주세요."
+                    password != passwordConfirm -> message = "비밀번호가 서로 다릅니다."
+                    email.isBlank() || email.length > 30 || !email.contains("@") -> message = "이메일은 30자리 이내의 올바른 형식으로 입력해주세요."
+                    phoneNumber.length < 10 -> message = "전화번호를 입력해주세요."
+                    birthDate.length != 8 -> message = "생년월일 8자리를 입력해주세요."
+                    else -> {
+                        isLoading = true
+                        message = null
+                        val profile = UserProfile(
+                            userId = userId,
+                            email = email.trim(),
+                            phoneNumber = phoneNumber,
+                            birthDate = birthDate
+                        )
+                        onSignUpClick(profile, password) { resultMessage ->
+                            isLoading = false
+                            message = resultMessage
+                        }
+                    }
+                }
+            },
+            enabled = firebaseConfigured && !isLoading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(58.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+        ) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = Color.White
+                )
+            } else {
+                Text(
+                    text = "가입하기",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            }
+        }
+
+        TextButton(
+            onClick = onBackClick,
+            enabled = !isLoading,
+            modifier = Modifier.align(Alignment.CenterHorizontally)
+        ) {
+            Text("로그인으로 돌아가기", color = bodyTextColor, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun SignUpScreen(
+    firebaseConfigured: Boolean,
+    onBackClick: () -> Unit,
+    onSignUpClick: (String, String, (String?) -> Unit) -> Unit
+) {
+    var userId by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var passwordConfirm by remember { mutableStateOf("") }
+    var phoneNumber by remember { mutableStateOf("") }
+    var birthDate by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Spacer(modifier = Modifier.height(42.dp))
+        Text(
+            text = "회원가입",
+            fontSize = 34.sp,
+            lineHeight = 40.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "신고 계정에 사용할 정보를 입력해주세요.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        OutlinedTextField(
+            value = userId,
+            onValueChange = { userId = it.trim().take(24) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("아이디") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors()
+        )
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("비밀번호") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+        )
+        OutlinedTextField(
+            value = passwordConfirm,
+            onValueChange = { passwordConfirm = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("비밀번호 확인") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+        )
+        OutlinedTextField(
+            value = email,
+            onValueChange = { email = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("이메일") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email)
+        )
+        OutlinedTextField(
+            value = phoneNumber,
+            onValueChange = { phoneNumber = it.filter { char -> char.isDigit() }.take(11) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("전화번호") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+            visualTransformation = PhoneNumberVisualTransformation
+        )
+        OutlinedTextField(
+            value = birthDate,
+            onValueChange = { birthDate = it.filter { char -> char.isDigit() }.take(8) },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("생년월일") },
+            placeholder = { Text("YYYYMMDD") },
+            singleLine = true,
+            enabled = !isLoading && firebaseConfigured,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+            colors = loginTextFieldColors(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+        )
+
+        message?.let {
+            Text(
+                text = it,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = Color(0xFFB3261E)
+            )
+        }
+
+        Button(
+            onClick = {
+                when {
+                    userId.isBlank() -> message = "아이디를 입력해주세요."
+                    password.length < 6 -> message = "비밀번호는 6자리 이상이어야 합니다."
+                    password != passwordConfirm -> message = "비밀번호가 서로 다릅니다."
+                    email.isBlank() -> message = "이메일을 입력해주세요."
+                    phoneNumber.length < 10 -> message = "전화번호를 입력해주세요."
+                    birthDate.length != 8 -> message = "생년월일 8자리를 입력해주세요."
+                    else -> {
+                        isLoading = true
+                        message = null
+                        onSignUpClick(email, password) { resultMessage ->
+                            isLoading = false
+                            message = resultMessage
+                        }
+                    }
+                }
+            },
+            enabled = firebaseConfigured && !isLoading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(58.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = primaryButtonColor)
+        ) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = Color.White
+                )
+            } else {
+                Text(
+                    text = "가입하기",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            }
+        }
+
+        TextButton(
+            onClick = onBackClick,
+            enabled = !isLoading,
+            modifier = Modifier.align(Alignment.CenterHorizontally)
+        ) {
+            Text("로그인으로 돌아가기", color = bodyTextColor, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun loginTextFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = Color.Black,
+    unfocusedTextColor = Color.Black,
+    disabledTextColor = Color(0xFF94A3B8),
+    cursorColor = primaryButtonColor,
+    focusedBorderColor = primaryButtonColor,
+    unfocusedBorderColor = appBorderColor,
+    focusedLabelColor = Color.Black,
+    unfocusedLabelColor = Color.Black,
+    focusedPlaceholderColor = Color(0xFF94A3B8),
+    unfocusedPlaceholderColor = Color(0xFF94A3B8)
+)
+
 @Composable
 private fun HomeScreen(
     reports: List<ReportHistoryItem>,
+    profileImagePath: String,
     onReportClick: () -> Unit,
     onHistoryClick: () -> Unit,
     onReportSelected: (ReportHistoryItem) -> Unit,
@@ -509,6 +2364,9 @@ private fun HomeScreen(
         .take(3)
         .map<ReportHistoryItem, ReportHistoryItem?> { it } +
         List((3 - recentThreeMonthReports.size).coerceAtLeast(0)) { null }
+    val profileBitmap = remember(profileImagePath) {
+        profileImagePath.takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(it) }
+    }
 
     Column(
         modifier = Modifier
@@ -518,13 +2376,24 @@ private fun HomeScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Spacer(modifier = Modifier.height(30.dp))
-        Text(
-            text = "불법 주정차 신고",
-            fontSize = 32.sp,
-            lineHeight = 38.sp,
-            fontWeight = FontWeight.ExtraBold,
-            color = headingColor
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top
+        ) {
+            Text(
+                text = "불법 주정차 신고",
+                modifier = Modifier.weight(1f),
+                fontSize = 32.sp,
+                lineHeight = 38.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = headingColor
+            )
+            HomeProfileAvatar(
+                bitmap = profileBitmap,
+                onClick = onProfileClick
+            )
+        }
         Text(
             text = "대한민국의 깨끗한 도로를 위해",
             fontSize = 17.sp,
@@ -567,11 +2436,11 @@ private fun HomeScreen(
             )
             GradientMenuCard(
                 modifier = Modifier.weight(1f),
-                title = "도움말",
+                title = "마이페이지",
                 subtitle = "신고 기준",
                 gradient = tileGradients[3],
                 onClick = {
-                    Toast.makeText(context, "도움말 화면은 다음 단계에서 추가합니다.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "도움말 화면은 다음 단계에서 추가됩니다.", Toast.LENGTH_SHORT).show()
                 }
             )
         }
@@ -585,7 +2454,50 @@ private fun HomeScreen(
     }
 }
 
-// 홈 하단 요약 카드입니다. 비어 있어도 3개 슬롯을 유지해 화면 높이가 갑자기 변하지 않게 합니다.
+@Composable
+private fun HomeProfileAvatar(bitmap: Bitmap?, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .clip(CircleShape)
+            .background(appMutedColor)
+            .border(2.dp, appBorderColor, CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = "프로필 이미지",
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Canvas(modifier = Modifier.size(30.dp)) {
+                val strokeWidth = 3.dp.toPx()
+                drawCircle(
+                    color = headingColor,
+                    radius = size.minDimension * 0.22f,
+                    center = Offset(size.width / 2f, size.height * 0.32f),
+                    style = Stroke(width = strokeWidth)
+                )
+                drawArc(
+                    color = headingColor,
+                    startAngle = 205f,
+                    sweepAngle = 130f,
+                    useCenter = false,
+                    topLeft = Offset(size.width * 0.14f, size.height * 0.44f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.52f),
+                    style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                )
+            }
+        }
+    }
+}
+
+// 홈 하단 요약 카드입니다. 기록이 적어도 화면 높이가 갑자기 변하지 않도록 빈 행을 채웁니다.
 @Composable
 private fun RecentThreeMonthHistorySection(
     reports: List<ReportHistoryItem?>,
@@ -594,7 +2506,7 @@ private fun RecentThreeMonthHistorySection(
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F7FE))
+        colors = CardDefaults.cardColors(containerColor = appMutedColor)
     ) {
         Column(
             modifier = Modifier
@@ -648,7 +2560,7 @@ private fun RecentThreeMonthHistorySection(
     }
 }
 
-// 신고내역 전체 조회 화면입니다. 기간 필터, 정렬, 페이지네이션을 조합해 많은 기록도 한 화면 단위로 확인합니다.
+// 신고내역 전체 조회 화면입니다. 기간 필터, 정렬, 페이지 크기를 조합해 많은 기록도 화면 단위로 확인합니다.
 @Composable
 private fun ReportHistoryScreen(
     reports: List<ReportHistoryItem>,
@@ -696,7 +2608,7 @@ private fun ReportHistoryScreen(
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFEEF4FC))
+            colors = CardDefaults.cardColors(containerColor = appMutedColor)
         ) {
             Column(
                 modifier = Modifier
@@ -909,7 +2821,7 @@ private fun RecentHistoryRow(
                 }
                 Box(
                     modifier = Modifier
-                        .background(Color(0xFFEAF1FF), RoundedCornerShape(8.dp))
+                        .background(appAccentColor, RoundedCornerShape(8.dp))
                         .padding(horizontal = 10.dp, vertical = 5.dp)
                 ) {
                     Text(
@@ -973,7 +2885,7 @@ private fun DateRangeFilterButton(
             )
         ) {
             Text(
-                text = "$label ▼",
+                text = "$label >",
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
                 fontWeight = FontWeight.Bold,
@@ -1088,7 +3000,7 @@ private fun ReportHistoryRow(
                     color = bodyTextColor
                 )
                 Text(
-                    text = if (report == null) "-" else "${report.violationType} · ${report.plate}",
+                    text = if (report == null) "-" else "${report.violationType} 쨌 ${report.plate}",
                     fontSize = 14.sp,
                     lineHeight = 18.sp,
                     fontWeight = FontWeight.Bold,
@@ -1111,7 +3023,7 @@ private fun ReportHistoryDetailScreen(
     report: ReportHistoryItem,
     onBackClick: () -> Unit
 ) {
-    // 차량 사진은 두 장을 "file1, file2" 형태로 저장하므로 상세 화면에서는 파일명 배열로 다시 분리합니다.
+    // 차량 사진은 여러 장을 "file1, file2" 형태로 저장하므로 상세 화면에서 파일명 배열로 다시 분리합니다.
     val photoFileNames = report.photoFileNames
         .split(",")
         .map { it.trim() }
@@ -1144,7 +3056,7 @@ private fun ReportHistoryDetailScreen(
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F7FE))
+            colors = CardDefaults.cardColors(containerColor = appMutedColor)
         ) {
             Column(
                 modifier = Modifier
@@ -1153,7 +3065,7 @@ private fun ReportHistoryDetailScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "세부 위반 내역",
+                    text = "위반 내역",
                     fontSize = 21.sp,
                     lineHeight = 26.sp,
                     fontWeight = FontWeight.ExtraBold,
@@ -1164,14 +3076,14 @@ private fun ReportHistoryDetailScreen(
                 ReportInfoRow(label = "위반 유형", value = report.violationType)
                 ReportInfoRow(label = "번호판", value = report.plate)
                 ReportInfoRow(label = "연락처", value = formatPhoneNumber(report.phoneNumber))
-                ReportInfoRow(label = "신고 내용", value = report.content.ifBlank { "입력된 내용 없음" })
+                ReportInfoRow(label = "신고 내용", value = report.content.ifBlank { "입력한 내용 없음" })
             }
         }
 
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F7FE))
+            colors = CardDefaults.cardColors(containerColor = appMutedColor)
         ) {
             Column(
                 modifier = Modifier
@@ -1245,7 +3157,7 @@ private fun SavedVehiclePhotoPreview(
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
-            text = "$title · $fileName",
+            text = "$title 쨌 $fileName",
             fontSize = 13.sp,
             lineHeight = 18.sp,
             fontWeight = FontWeight.Bold,
@@ -1295,7 +3207,7 @@ private fun formatPhoneNumber(phoneNumber: String): String {
     }
 }
 
-// 메인 메뉴와 법령 선택을 같은 카드 패턴으로 보여줘 사용자가 "선택 가능한 항목"을 한눈에 알아보게 합니다.
+// 메인 메뉴는 법령 선택처럼 같은 카드 패턴으로 보여주어 사용자가 선택 가능한 항목을 한눈에 파악하게 합니다.
 @Composable
 private fun GradientMenuCard(
     modifier: Modifier = Modifier,
@@ -1341,7 +3253,7 @@ private fun GradientMenuCard(
     }
 }
 
-// 주요 행동 버튼의 크기와 색을 통일해 이전/다음/완료/홈 이동 버튼이 같은 우선순위로 보이게 합니다.
+// 주요 행동 버튼의 크기와 색을 통일해 이전, 다음, 완료 같은 이동 버튼을 같은 우선순위로 보이게 합니다.
 @Composable
 private fun PrimaryActionButton(
     modifier: Modifier = Modifier,
@@ -1365,7 +3277,7 @@ private fun PrimaryActionButton(
     }
 }
 
-// 법령 카테고리를 먼저 고르게 해서 이후 세부 유형 목록을 불필요하게 길게 만들지 않습니다.
+// 법령 카테고리를 먼저 고르게 해서 이후 세부 위반 유형 목록이 불필요하게 길어지지 않게 합니다.
 @Composable
 private fun ViolationCategoryScreen(
     onBackClick: () -> Unit,
@@ -1386,7 +3298,7 @@ private fun ViolationCategoryScreen(
             color = headingColor
         )
         Text(
-            text = "먼저 신고 기준이 되는 법령 카테고리를 선택하세요.",
+            text = "먼저 신고 기준이 되는 법령 카테고리를 선택하세요",
             fontSize = 16.sp,
             lineHeight = 23.sp,
             fontWeight = FontWeight.Medium,
@@ -1436,7 +3348,7 @@ private fun ViolationTypeScreen(
             color = headingColor
         )
         Text(
-            text = "세부 위반유형을 선택하면 차량 촬영 화면으로 이동합니다.",
+            text = "위반 유형을 선택하면 차량 촬영 화면으로 이동합니다.",
             fontSize = 16.sp,
             lineHeight = 23.sp,
             fontWeight = FontWeight.Medium,
@@ -1499,7 +3411,7 @@ private fun PermissionScreen(
     }
 }
 
-// 번호판 인식을 위한 촬영 단계입니다. 화면 가이드와 같은 영역을 우선 crop해 OCR 후보를 만들고, 사용자가 다음 화면에서 수정할 수 있게 넘깁니다.
+// 번호판 인식을 위한 촬영 단계입니다. 화면 가이드 영역을 우선 crop하고 OCR 후보를 만든 뒤 사용자가 다음 화면에서 수정할 수 있게 합니다.
 @Composable
 private fun PlateOcrCameraScreen(
     categoryName: String,
@@ -1664,7 +3576,7 @@ private fun PlateOcrCameraScreen(
     }
 }
 
-// 신고 증빙용 차량 사진을 두 장 확보합니다. OCR은 이미 끝난 뒤라 여기서는 파일 저장과 첨부 기록만 담당합니다.
+// 신고 증빙용 차량 사진은 OCR이 필요 없으므로 파일 저장과 첨부 기록만 처리합니다.
 @Composable
 private fun VehiclePhotoCameraScreen(
     categoryName: String,
@@ -1686,9 +3598,9 @@ private fun VehiclePhotoCameraScreen(
     var isProcessing by remember { mutableStateOf(false) }
     var firstPhotoFileName by remember { mutableStateOf("") }
     val captureMessage = if (firstPhotoFileName.isBlank()) {
-        "차량 앞 뒤 총 2장을 찍어주세요"
+        "차량 사진 총 2장을 찍어주세요"
     } else {
-        "한번 더찍어주세요"
+        "한 번 더 촬영해주세요"
     }
 
     DisposableEffect(Unit) {
@@ -1867,7 +3779,7 @@ private fun CaptureNotice(
     }
 }
 
-// 화면에 보이는 가이드 비율과 실제 crop 비율을 맞춰 OCR 대상 영역이 사용자의 기대와 어긋나지 않게 합니다.
+// 화면 가이드 비율과 실제 crop 비율을 맞춰 OCR 대상 영역이 사용자의 기대와 어긋나지 않게 합니다.
 @Composable
 private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
@@ -1887,7 +3799,7 @@ private fun PlateGuideOverlay(modifier: Modifier = Modifier) {
     }
 }
 
-// 다음 단계로 넘어가기 전에 빠진 입력이나 형식 오류를 화면 상단에서 즉시 알려줍니다.
+// 다음 단계로 넘어가기 전에 빈 입력이나 형식 오류를 화면 상단에서 즉시 알려줍니다.
 @Composable
 private fun InlineWarningBanner(
     modifier: Modifier = Modifier,
@@ -1963,7 +3875,7 @@ private fun PlateConfirmScreen(
             color = headingColor
         )
         Text(
-            text = "다시한번 정확한지 확인해주세요",
+            text = "다시 한번 정확한지 확인해주세요",
             fontSize = 17.sp,
             lineHeight = 24.sp,
             fontWeight = FontWeight.Medium,
@@ -1985,7 +3897,7 @@ private fun PlateConfirmScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(92.dp)
-                    .border(1.dp, Color(0xFFD8DDE8), RoundedCornerShape(8.dp))
+                    .border(1.dp, appBorderColor, RoundedCornerShape(8.dp))
                     .padding(6.dp),
                 contentScale = ContentScale.Fit
             )
@@ -2039,7 +3951,7 @@ private fun PlateConfirmScreen(
     }
 }
 
-// 제출 직전 단계입니다. 촬영된 첨부 파일명과 OCR 번호판을 확인하고, 신고 내용/연락처를 함께 수집합니다.
+// 제출 직전 단계입니다. 촬영한 첨부 파일명과 OCR 번호판을 확인하고 신고 내용과 연락처를 함께 수집합니다.
 @Composable
 private fun ReportDetailScreen(
     violationType: String,
@@ -2104,7 +4016,7 @@ private fun ReportDetailScreen(
             modifier = Modifier.fillMaxWidth(),
             value = photoFileName,
             onValueChange = {},
-            label = { Text(text = "첨부사진") },
+            label = { Text(text = "첨부 사진") },
             singleLine = true,
             readOnly = true,
             textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
@@ -2133,7 +4045,7 @@ private fun ReportDetailScreen(
                     fontSize = 13.sp
                 )
             },
-            placeholder = { Text(text = "불법 주정차 위반 사항을 신고해 주세요.") },
+            placeholder = { Text(text = "불법 주정차 위반 사항을 신고해주세요") },
             minLines = 5,
             maxLines = 5,
             textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.Black),
@@ -2144,7 +4056,7 @@ private fun ReportDetailScreen(
             modifier = Modifier.fillMaxWidth(),
             value = phoneNumber,
             onValueChange = onPhoneNumberChange,
-            label = { Text(text = "휴대전화") },
+            label = { Text(text = "내 전화") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             visualTransformation = PhoneNumberVisualTransformation,
@@ -2171,7 +4083,7 @@ private fun ReportDetailScreen(
                 text = "다음으로",
                 onClick = {
                     if (plate.isBlank() || content.length < 5 || phoneNumber.length != 11) {
-                        warningMessage = "알맞은 양식으로 입력해주세요"
+                        warningMessage = "알맞은 형식으로 입력해주세요"
                     } else {
                         warningMessage = ""
                         onNextClick()
@@ -2188,10 +4100,10 @@ private fun reportDetailTextFieldColors() = OutlinedTextFieldDefaults.colors(
     unfocusedTextColor = Color.Black,
     focusedLabelColor = primaryButtonColor,
     unfocusedLabelColor = bodyTextColor,
-    focusedPlaceholderColor = Color(0xFFB9C0CC),
-    unfocusedPlaceholderColor = Color(0xFFB9C0CC),
+    focusedPlaceholderColor = Color(0xFF94A3B8),
+    unfocusedPlaceholderColor = Color(0xFF94A3B8),
     focusedBorderColor = primaryButtonColor,
-    unfocusedBorderColor = Color(0xFF8F95A1),
+    unfocusedBorderColor = appBorderColor,
     cursorColor = primaryButtonColor,
     focusedContainerColor = Color.White,
     unfocusedContainerColor = Color.White
@@ -2227,7 +4139,7 @@ private fun FalseReportWarningScreen(
         Spacer(modifier = Modifier.height(22.dp))
 
         Text(
-            text = "한번 더 확인해주세요",
+            text = "한 번 더 확인해주세요",
             fontSize = 24.sp,
             lineHeight = 30.sp,
             fontWeight = FontWeight.ExtraBold,
@@ -2237,7 +4149,7 @@ private fun FalseReportWarningScreen(
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "허위 신고시 무고죄 또는 공무집행방해죄로 법적 처벌을 받을 수 있습니다",
+            text = "허위 신고는 무고죄 또는 공무집행방해죄로 법적 처벌을 받을 수 있습니다",
             fontSize = 15.sp,
             lineHeight = 22.sp,
             fontWeight = FontWeight.Medium,
@@ -2265,7 +4177,7 @@ private fun FalseReportWarningScreen(
     }
 }
 
-// 접수 완료 후 사용자가 다음에 어디서 확인하면 되는지 안내하고, 홈으로 돌아가도록 마무리합니다.
+// 접수 완료 후 사용자가 다음에 어디서 확인하면 되는지 안내하고 홈으로 돌아가도록 마무리합니다.
 @Composable
 private fun ReportCompleteScreen(
     onHomeClick: () -> Unit
@@ -2313,7 +4225,7 @@ private fun ReportCompleteScreen(
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "최종 처리는 7일에서 14일 정도 소요됩니다.\n신고 내역은 홈 > 신고내역 페이지에서 확인이 가능합니다",
+            text = "최종 처리는 7일에서 14일 정도 소요됩니다.\n신고 내역은 홈 > 신고내역 페이지에서 확인할 수 있습니다",
             fontSize = 15.sp,
             lineHeight = 22.sp,
             fontWeight = FontWeight.Medium,
@@ -2331,7 +4243,7 @@ private fun ReportCompleteScreen(
     }
 }
 
-// 번호판 OCR용 원본 사진을 cacheDir에 저장하고, 저장된 파일을 기준으로 crop/OCR 파이프라인을 시작합니다.
+// 번호판 OCR은 원본 사진을 cacheDir에 저장하고, 저장된 파일을 기준으로 crop/OCR 파이프라인을 시작합니다.
 private fun captureAndRecognizePlate(
     context: Context,
     imageCapture: ImageCapture,
@@ -2406,7 +4318,7 @@ private fun capturePhoto(
     )
 }
 
-// 저장된 사진을 실제 방향으로 보정한 뒤, 가이드 crop과 OpenCV 후보 crop을 모두 OCR 후보로 평가합니다.
+// 저장된 사진을 실제 방향으로 보정한 뒤 가이드 crop과 OpenCV 후보 crop을 모두 OCR 후보로 평가합니다.
 private fun recognizePlateFromImage(
     context: Context,
     uri: Uri,
@@ -2502,7 +4414,7 @@ private fun processPlateBitmapCandidates(
         }
     }
 
-    // 정규 번호판 형식이 하나라도 있으면 한글이 빠진 숫자열 fallback보다 우선합니다.
+    // 정규 번호판 형식이 하나라도 있으면 숫자만 많은 fallback보다 우선합니다.
     val strictCandidates = candidateResults.filter { result ->
         isStrictKoreanPlate(result.plateText)
     }
@@ -2529,7 +4441,7 @@ private fun processPlateBitmapCandidates(
     onError("번호판 형식으로 인식하지 못했습니다. 번호판이 선명하게 보이도록 다시 촬영해주세요.")
 }
 
-// 정규식에 딱 맞지 않아도 사용자가 확인 화면에서 고치기 쉬운 후보를 살리기 위한 점수입니다.
+// 정규식에 맞지 않아도 사용자가 확인 화면에서 고치기 쉬운 후보를 남기기 위한 점수입니다.
 private fun scoreOcrFallback(text: String): Int {
     if (text.isBlank()) return Int.MIN_VALUE
 
@@ -2541,7 +4453,7 @@ private fun scoreOcrFallback(text: String): Int {
     return score
 }
 
-// 여러 OCR 후보를 비교할 때 crop 이미지, 원문, 정규화 결과, 점수를 함께 들고 다닙니다.
+// 여러 OCR 후보를 비교할 수 있도록 crop 이미지, 원문, 정규화 결과, 점수를 함께 담습니다.
 private data class OcrCandidateResult(
     val bitmap: Bitmap,
     val ocrText: String,
@@ -2579,7 +4491,7 @@ private fun isStrictKoreanPlate(text: String): Boolean {
     return Regex("^[0-9]{2,3}[가-힣][0-9]{4}$").matches(text)
 }
 
-// 너무 어둡거나, 가장자리에 장식/노이즈가 많이 잡힌 crop은 번호판 후보 점수에서 감점합니다.
+// 너무 어둡거나 가장자리에 장식/노이즈가 많은 crop은 번호판 후보 점수에서 감점합니다.
 private fun estimatePreprocessingCandidatePenalty(bitmap: Bitmap): Int {
     return estimateBinaryCandidatePenalty(bitmap) +
         estimateSideArtifactPenalty(bitmap) +
@@ -2660,7 +4572,7 @@ private fun estimateDarkRatio(bitmap: Bitmap, startX: Int, endX: Int): Float {
     return dark.toFloat() / total.coerceAtLeast(1)
 }
 
-// 여러 전처리 후보가 같은 번호판을 가리킬 때, 점수와 빈도를 함께 봐서 최종 문자열을 안정화합니다.
+// 여러 전처리 후보가 같은 번호판을 가리킬 때 점수와 빈도를 함께 봐서 최종 문자열을 안정화합니다.
 private fun buildPlateConsensus(results: List<OcrCandidateResult>): String? {
     if (results.isEmpty()) return null
 
@@ -2763,7 +4675,7 @@ private fun recognizePlateByCharacterSegments(context: Context, bitmap: Bitmap):
     return plate.takeIf { findKoreanPlateCandidate(it) == it }
 }
 
-// 번호판 한 글자씩의 세로 획 묶음을 찾아 단일 글자 OCR 입력으로 사용할 작은 이미지를 만듭니다.
+// 번호판의 글자 덩어리별로 어두운 묶음을 찾아 단일 글자 OCR 입력으로 사용할 작은 이미지를 만듭니다.
 private fun extractCharacterBitmaps(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -2932,7 +4844,7 @@ private fun loadOrientedBitmap(context: Context, uri: Uri): Bitmap {
     return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
 }
 
-// 사용자가 화면에서 맞춘 흰색 가이드 위치와 같은 중앙 영역을 원본 사진에서도 잘라냅니다.
+// 사용자가 화면에서 맞춘 흰색 가이드 위치와 같은 중앙 영역을 원본 사진에서 잘라냅니다.
 private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
     val cropWidth = (bitmap.width * PLATE_GUIDE_WIDTH_RATIO).toInt().coerceAtLeast(1)
     val cropHeight = (bitmap.height * PLATE_GUIDE_HEIGHT_RATIO).toInt().coerceAtLeast(1)
@@ -2944,7 +4856,7 @@ private fun cropPlateGuideArea(bitmap: Bitmap): Bitmap {
     return Bitmap.createBitmap(bitmap, left, top, safeWidth, safeHeight)
 }
 
-// 가이드 crop이 빗나간 경우를 보완하기 위해 사진 전체에서 번호판 비율에 가까운 사각형 후보를 추가로 찾습니다.
+// 가이드 crop이 빗나간 경우를 보완하기 위해 사진 전체에서 번호판 비율에 가까운 사각 후보를 추가로 찾습니다.
 private fun cropBrightPlateAreaInsideGuide(bitmap: Bitmap): Bitmap {
     if (bitmap.width <= 2 || bitmap.height <= 2) return bitmap
 
@@ -3263,7 +5175,7 @@ private data class CharacterGroup(
     val score: Double
 )
 
-// 번호판 테두리 검출이 흔들릴 때 글자 contour 묶음을 기준으로 crop 영역을 더 정교하게 보정합니다.
+// 번호판 테두리 검출이 흔들릴 때 글자 contour 묶음을 기준으로 crop 영역을 더 정확하게 보정합니다.
 private fun detectPlateCandidatesByCharacterGroups(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3512,7 +5424,7 @@ private fun expandCharacterGroupBounds(bounds: Rect, imageWidth: Int, imageHeigh
     return Rect(left, top, (right - left).coerceAtLeast(1), (bottom - top).coerceAtLeast(1))
 }
 
-// 글자 묶음 주변을 실제 번호판 비율로 다시 확장해 한쪽이 잘린 crop을 줄입니다.
+// 글자 묶음 주변을 실제 번호판 비율로 다시 확장해 좌우가 잘린 crop을 줄입니다.
 private fun expandCharacterGroupBoundsToOfficialPlateRatio(
     bounds: Rect,
     imageWidth: Int,
@@ -3543,7 +5455,7 @@ private fun expandCharacterGroupBoundsToOfficialPlateRatio(
     return Rect(left, top, targetWidthInt, targetHeightInt)
 }
 
-// 글자 contour 보정이 실패했을 때를 대비해 edge 기반의 넓은 사각형 후보를 fallback으로 사용합니다.
+// 글자 contour 보정이 실패할 때를 대비해 edge 기반의 넓은 사각 후보를 fallback으로 사용합니다.
 private fun detectPlateCandidates(bitmap: Bitmap): List<Bitmap> {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3615,7 +5527,7 @@ private fun saveDebugPlateCrop(context: Context, bitmap: Bitmap, sourceFileName:
     return debugFile.absolutePath
 }
 
-// 모니터/카메라 재촬영에서 생기는 촘촘한 줄무늬가 OCR 획으로 인식되지 않도록 약하게 완화합니다.
+// 모니터 촬영에서 생기는 촘촘한 줄무늬가 OCR 획으로 인식되지 않도록 약하게 완화합니다.
 private fun smoothPlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3640,7 +5552,7 @@ private fun smoothPlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 한글 획 손상을 줄이기 위해 강한 이진화 전, 대비/노이즈/선명도만 보정한 후보를 먼저 만듭니다.
+// 획 손상을 줄이기 위해 강한 이진화 대신 대비와 노이즈를 선명하게 보정한 후보를 먼저 만듭니다.
 private fun strongBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3682,7 +5594,7 @@ private fun strongBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 얇게 찍힌 글자는 숫자 특징이 약해져서, 검은 획만 조금 두껍게 만든 후보도 OCR에 함께 넣습니다.
+// 얇게 잡힌 글자는 숫자 특징이 약해져서, 검은 획만 조금 두껍게 만든 후보도 OCR에 넣습니다.
 private fun boldBinarizePlateBitmap(bitmap: Bitmap, iterations: Int): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3707,7 +5619,7 @@ private fun boldBinarizePlateBitmap(bitmap: Bitmap, iterations: Int): Bitmap {
         Core.addWeighted(contrast, 1.85, blurred, -0.85, 0.0, sharpened)
         Imgproc.threshold(sharpened, binary, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
 
-        // 흰 배경/검은 글자 이미지에서는 흰 영역을 줄이면 상대적으로 검은 획이 두꺼워집니다.
+        // 흰 배경과 검은 글자 영역에서만 팽창을 적용해 배경 노이즈가 글자로 번지는 것을 줄입니다.
         Imgproc.erode(
             binary,
             thickened,
@@ -3767,7 +5679,7 @@ private fun enhanceReadablePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// crop된 번호판을 확대하고 명암을 정리해 ONNX 모델이 학습 때와 비슷한 입력을 받게 합니다.
+// crop의 번호판을 정렬하고 명암을 보정해 ONNX 모델이 학습 때와 비슷한 입력을 받게 합니다.
 private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3801,7 +5713,7 @@ private fun enhancePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 배경 줄무늬나 그림자를 줄이기 위해 글자와 배경을 더 강하게 분리한 후보도 준비합니다.
+// 배경 줄무늬나 그림자를 줄이기 위해 글자와 배경을 강하게 분리한 후보를 준비합니다.
 private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
         error("OpenCV 초기화에 실패했습니다.")
@@ -3834,7 +5746,7 @@ private fun binarizePlateBitmap(bitmap: Bitmap): Bitmap {
     }
 }
 
-// 전체 번호판 CTC 모델 결과에서 한국 번호판 형식에 가까운 문자열만 후보로 추립니다.
+// 전체 번호판 CTC 모델 결과에서 한국 번호판 형식에 가까운 문자만 후보로 추립니다.
 // 모델과 charset은 assets에 포함된 학습 결과를 사용합니다.
 private fun adaptiveBinarizePlateBitmap(bitmap: Bitmap): Bitmap {
     if (!OpenCVLoader.initLocal()) {
@@ -3976,8 +5888,8 @@ private object PlateOcrOnnxRecognizer {
     }
 }
 
-// 글자를 따로 잘라낸 후보는 전체 번호판 모델보다 단일 글자 분류 모델이 안정적이라 별도 경로로 읽습니다.
-// 자리 정보를 이용해 숫자/한글 후보군을 제한해 엉뚱한 문자 선택을 줄입니다.
+// 글자를 따로 자른 후보는 전체 번호판 모델보다 단일 글자 분류 모델이 안정적이어서 별도 경로로 읽습니다.
+// 자리 정보를 이용해 숫자와 한글 후보군을 제한하면 문자 선택이 더 안정적입니다.
 private object CharOcrOnnxRecognizer {
     private const val MODEL_ASSET_NAME = "char_ocr.onnx"
     private const val CHARSET_ASSET_NAME = "char_charset.txt"
@@ -4018,7 +5930,7 @@ private object CharOcrOnnxRecognizer {
         }
     }
 
-    // 단일 글자 모델도 학습 때와 같은 48x48 흰 배경 입력을 맞춰야 정확도가 유지됩니다.
+    // 단일 글자 모델은 학습 때와 같은 48x48 흰 배경 입력에 맞춰야 정확도가 유지됩니다.
     private fun bitmapToModelInput(bitmap: Bitmap): FloatArray {
         val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
         val scale = minOf(INPUT_SIZE.toFloat() / source.width, INPUT_SIZE.toFloat() / source.height)
