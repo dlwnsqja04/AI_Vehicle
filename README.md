@@ -74,7 +74,7 @@ Android 번호판 인식 기반 불법 주정차 신고 앱입니다. CameraX로
 ## 프로젝트 구조
 
 ```text
-D:\AI
+...\AI
 ├─ app
 │  ├─ src\main\java\com\example\vehiclelicensereportapp
 │  │  └─ MainActivity.kt
@@ -144,14 +144,14 @@ Firebase 설정 파일이 없어도 앱은 비회원/로컬 저장 방식으로 
 Windows PowerShell 기준:
 
 ```powershell
-cd D:\AI
+cd D:\...\AI
 .\gradlew.bat :app:assembleDebug
 ```
 
 빌드 결과 APK는 일반적으로 다음 위치에 생성됩니다.
 
 ```text
-D:\AI\app\build\outputs\apk\debug\app-debug.apk
+D:\...\AI\app\build\outputs\apk\debug\app-debug.apk
 ```
 
 ## 현재 참고 사항
