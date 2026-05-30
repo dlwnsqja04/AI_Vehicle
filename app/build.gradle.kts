@@ -59,6 +59,7 @@ dependencies {
     implementation(libs.firebase.auth)
     implementation(libs.firebase.firestore)
     implementation(libs.firebase.storage)
+    implementation("com.kakao.maps.open:android:2.13.2")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     implementation("org.opencv:opencv:4.13.0")
     testImplementation(libs.junit)

@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Vehicle license ReportApp</string>
+    <string name="kakao_native_app_key">198999f7ac48f9e155b243efb333da4d</string>
 </resources>
