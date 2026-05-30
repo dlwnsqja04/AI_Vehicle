@@ -1,14 +1,19 @@
 package com.example.vehiclelicensereportapp
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.location.Location
+import android.location.LocationManager
 import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
 import android.os.Handler
 import android.os.Looper
 import android.util.Rational
@@ -43,6 +48,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -87,6 +93,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -99,9 +106,20 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
 import com.google.firebase.storage.FirebaseStorage
+import com.kakao.vectormap.GestureType
+import com.kakao.vectormap.KakaoMap
+import com.kakao.vectormap.KakaoMapReadyCallback
+import com.kakao.vectormap.KakaoMapSdk
+import com.kakao.vectormap.LatLng
+import com.kakao.vectormap.MapLifeCycleCallback
+import com.kakao.vectormap.MapView
+import com.kakao.vectormap.camera.CameraPosition
+import com.kakao.vectormap.camera.CameraUpdateFactory
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -120,11 +138,16 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.exp
 
 // Android 진입점에서는 Compose 루트만 연결하고, 실제 화면 흐름은 PlateReportApp에서 관리합니다.
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val kakaoNativeKey = getString(R.string.kakao_native_app_key).trim()
+        if (kakaoNativeKey.isNotBlank() && kakaoNativeKey != "YOUR_KAKAO_NATIVE_APP_KEY") {
+            KakaoMapSdk.init(this, kakaoNativeKey)
+        }
         enableEdgeToEdge()
         setContent {
             VehicleLicenseReportAppTheme {
@@ -160,6 +183,7 @@ private fun PlateReportApp() {
     var vehiclePhotoFileNames by remember { mutableStateOf("") }
     var reportContent by remember { mutableStateOf("") }
     var phoneNumberDigits by remember { mutableStateOf("") }
+    var reportLocation by remember { mutableStateOf("") }
     // 신고 완료 후 신고내역 화면에 바로 반영하고, 앱을 다시 켜도 기록을 유지합니다.
     var reportHistory by remember { mutableStateOf(loadReportHistory(context)) }
     var selectedHistoryReport by remember { mutableStateOf<ReportHistoryItem?>(null) }
@@ -179,6 +203,7 @@ private fun PlateReportApp() {
         vehiclePhotoFileNames = ""
         reportContent = ""
         phoneNumberDigits = ""
+        reportLocation = ""
     }
     val signOut = {
         firebaseAuth?.signOut()
@@ -277,6 +302,7 @@ private fun PlateReportApp() {
                     reports = reportHistory,
                     profileImagePath = userProfile?.profileImagePath.orEmpty(),
                     onReportClick = { currentScreen = AppScreen.Category },
+                    onLawsClick = { currentScreen = AppScreen.RelatedLaws },
                     onHistoryClick = {
                         firebaseAuth?.currentUser?.uid?.let { uid ->
                             loadReportsFromFirestore(firestore, uid) { serverReports ->
@@ -297,6 +323,10 @@ private fun PlateReportApp() {
                         }
                         currentScreen = AppScreen.Profile
                     }
+                )
+
+                AppScreen.RelatedLaws -> RelatedLawsScreen(
+                    onBackClick = { currentScreen = AppScreen.Home }
                 )
 
                 AppScreen.Profile -> {
@@ -415,11 +445,23 @@ private fun PlateReportApp() {
                     plate = recognizedPlate,
                     content = reportContent,
                     phoneNumber = phoneNumberDigits,
+                    location = reportLocation,
                     onPlateChange = { recognizedPlate = it },
                     onContentChange = { reportContent = it.take(900) },
                     onPhoneNumberChange = { phoneNumberDigits = it.filter { char -> char.isDigit() }.take(11) },
+                    onLocationChange = { reportLocation = it.take(120) },
+                    onMapClick = { currentScreen = AppScreen.LocationPicker },
                     onBackClick = { currentScreen = AppScreen.PlateConfirm },
                     onNextClick = { currentScreen = AppScreen.FalseReportWarning }
+                )
+
+                AppScreen.LocationPicker -> LocationPickerScreen(
+                    currentLocation = reportLocation,
+                    onLocationSelected = { selectedLocation ->
+                        reportLocation = selectedLocation
+                        currentScreen = AppScreen.ReportDetail
+                    },
+                    onBackClick = { currentScreen = AppScreen.ReportDetail }
                 )
 
                 AppScreen.FalseReportWarning -> FalseReportWarningScreen(
@@ -438,6 +480,7 @@ private fun PlateReportApp() {
                             plate = recognizedPlate.ifBlank { "번호판 미입력" },
                             content = reportContent,
                             phoneNumber = phoneNumberDigits,
+                            location = reportLocation,
                             photoFileNames = vehiclePhotoFileNames,
                             status = "접수 완료"
                         )
@@ -480,7 +523,8 @@ private fun PlateReportApp() {
                 AppScreen.ReportHistoryDetail -> selectedHistoryReport?.let { report ->
                     ReportHistoryDetailScreen(
                         report = report,
-                        onBackClick = { currentScreen = AppScreen.ReportHistory }
+                        onBackClick = { currentScreen = AppScreen.ReportHistory },
+                        onHomeClick = { currentScreen = AppScreen.Home }
                     )
                 } ?: run {
                     currentScreen = AppScreen.ReportHistory
@@ -496,12 +540,14 @@ private enum class AppScreen {
     SignUp,
     Home,
     Profile,
+    RelatedLaws,
     Category,
     ViolationType,
     PlateCamera,
     PlateConfirm,
     VehicleCamera,
     ReportDetail,
+    LocationPicker,
     FalseReportWarning,
     ReportComplete,
     ReportHistory,
@@ -513,6 +559,14 @@ private data class ViolationCategory(
     val name: String,
     val description: String,
     val types: List<String>
+)
+
+private data class ViolationLawInfo(
+    val lawName: String,
+    val article: String,
+    val summary: String,
+    val detail: String,
+    val note: String
 )
 
 // 신고 완료 시점의 스냅샷입니다. 상세 화면 복원을 위해 사용자가 입력/촬영한 값을 함께 저장합니다.
@@ -537,6 +591,7 @@ private data class ReportHistoryItem(
     val plate: String,
     val content: String,
     val phoneNumber: String,
+    val location: String = "",
     val photoFileNames: String,
     val photoUrls: String = "",
     val status: String
@@ -680,6 +735,7 @@ private fun reportToMap(report: ReportHistoryItem, uid: String): Map<String, Any
         "plate" to report.plate,
         "content" to report.content,
         "phoneNumber" to report.phoneNumber,
+        "location" to report.location,
         "photoFileNames" to report.photoFileNames,
         "photoUrls" to report.photoUrls,
         "status" to report.status
@@ -699,6 +755,7 @@ private fun reportFromMap(id: String, data: Map<String, Any>): ReportHistoryItem
         plate = (data["plate"] as? String).orEmpty(),
         content = (data["content"] as? String).orEmpty(),
         phoneNumber = (data["phoneNumber"] as? String).orEmpty(),
+        location = (data["location"] as? String).orEmpty(),
         photoFileNames = (data["photoFileNames"] as? String).orEmpty(),
         photoUrls = (data["photoUrls"] as? String).orEmpty(),
         status = (data["status"] as? String).orEmpty()
@@ -816,6 +873,7 @@ private fun loadReportHistory(context: Context): List<ReportHistoryItem> {
                 plate = item.optString("plate"),
                 content = item.optString("content"),
                 phoneNumber = item.optString("phoneNumber"),
+                location = item.optString("location"),
                 photoFileNames = item.optString("photoFileNames"),
                 photoUrls = item.optString("photoUrls"),
                 status = item.optString("status")
@@ -840,6 +898,7 @@ private fun saveReportHistory(context: Context, reports: List<ReportHistoryItem>
                 .put("plate", report.plate)
                 .put("content", report.content)
                 .put("phoneNumber", report.phoneNumber)
+                .put("location", report.location)
                 .put("photoFileNames", report.photoFileNames)
                 .put("photoUrls", report.photoUrls)
                 .put("status", report.status)
@@ -875,6 +934,86 @@ private val violationCategories = listOf(
         types = listOf("친환경차 충전구역")
     )
 )
+
+private fun lawInfoForViolation(type: String): ViolationLawInfo = when (type) {
+    "소화전" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제32조 제6호",
+        summary = "소방용수시설 또는 비상소화장치가 설치된 곳으로부터 5m 이내는 정차 및 주차 금지 장소입니다.",
+        detail = "소방용수시설은 소방기본법 제10조에 따른 소화전ㆍ급수탑ㆍ저수조를 말하며, 비상소화장치는 화재 초기 대응을 위해 소방호스 또는 호스 릴 등을 연결해 사용하는 시설 또는 장치를 말합니다.",
+        note = "소화전, 급수탑, 저수조, 비상소화장치 주변 5m 이내에 차량이 정차ㆍ주차해 소방 활동 공간을 방해하는 경우에 해당합니다."
+    )
+    "교차로" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제32조 제1호 및 제2호",
+        summary = "교차로와 교차로의 가장자리, 도로의 모퉁이로부터 5m 이내는 정차 및 주차 금지 장소입니다.",
+        detail = "도로교통법 제32조 제1호는 교차로 자체를 금지 장소로 정하고, 제2호는 교차로 가장자리나 도로 모퉁이로부터 5m 이내인 곳을 추가로 금지합니다.",
+        note = "교차로 안, 교차로 바로 주변, 도로 모퉁이 5m 이내에 차량이 정차ㆍ주차해 통행 안전이나 원활한 소통을 방해하는 경우에 해당합니다."
+    )
+    "버스정류장" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제32조 제4호",
+        summary = "버스정류장 표시 기둥, 표지판 또는 정류장 표시선으로부터 10m 이내는 정차 및 주차 금지 장소입니다.",
+        detail = "다만 버스여객자동차 운전자가 운행시간 중 운행노선에 따른 정류장에서 승객을 태우거나 내리기 위해 정차 또는 주차하는 경우는 예외입니다.",
+        note = "일반 차량이 버스정류장 표지 또는 표시선 기준 10m 이내에 정차ㆍ주차해 버스 진입, 정차, 승하차를 방해하는 경우에 해당합니다."
+    )
+    "횡단보도" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제32조 제1호 및 제5호",
+        summary = "횡단보도 위와 횡단보도로부터 10m 이내인 곳은 정차 및 주차 금지 장소입니다.",
+        detail = "도로교통법 제32조 제1호는 횡단보도 자체를 금지 장소로 정하고, 제5호는 횡단보도로부터 10m 이내인 곳을 금지 장소로 정합니다.",
+        note = "차량이 횡단보도 위에 걸쳐 있거나 횡단보도 앞뒤 10m 이내에 정차ㆍ주차해 보행자 시야 또는 횡단 안전을 방해하는 경우에 해당합니다."
+    )
+    "어린이보호구역" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제12조, 제32조 제8호",
+        summary = "시장등이 지정한 어린이 보호구역은 정차 및 주차 금지 장소입니다.",
+        detail = "도로교통법 제12조는 어린이 보호구역의 지정ㆍ해제 및 관리 기준을 정하고, 제32조 제8호는 시장등이 지정한 어린이 보호구역을 정차 및 주차 금지 장소로 정합니다. 세부 지정ㆍ관리 절차는 어린이ㆍ노인 및 장애인 보호구역의 지정 및 관리에 관한 규칙을 따릅니다.",
+        note = "유치원, 초등학교, 특수학교, 어린이집 등 주변 도로가 어린이 보호구역으로 지정되어 있고, 그 구역 안에 차량이 정차ㆍ주차한 경우에 해당합니다."
+    )
+    "인도" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제32조 제1호",
+        summary = "보도와 차도가 구분된 도로의 보도는 정차 및 주차 금지 장소입니다.",
+        detail = "다만 주차장법에 따라 차도와 보도에 걸쳐 설치된 노상주차장은 예외로 봅니다.",
+        note = "차량의 일부 또는 전부가 보도 위를 침범해 보행자 통행 공간을 막거나 좁히는 경우에 해당합니다."
+    )
+    "기타" -> ViolationLawInfo(
+        lawName = "도로교통법",
+        article = "제32조 및 제33조",
+        summary = "그 밖의 정차ㆍ주차 금지 장소 또는 주차금지 장소에 해당하는 경우입니다.",
+        detail = "도로교통법 제32조는 정차 및 주차가 모두 금지되는 장소를 정하고, 제33조는 주차가 금지되는 장소를 정합니다. 제33조에는 터널 안, 다리 위, 도로공사 구역 가장자리 5m 이내, 시ㆍ도경찰청장이 지정한 장소 등이 포함됩니다.",
+        note = "소화전, 교차로, 버스정류장, 횡단보도, 어린이보호구역, 인도 중 하나로 분류하기 어렵지만 도로교통법상 주정차 금지 장소에 해당하는 경우에 사용합니다."
+    )
+    "장애인 전용구역" -> ViolationLawInfo(
+        lawName = "장애인ㆍ노인ㆍ임산부 등의 편의증진 보장에 관한 법률",
+        article = "제17조",
+        summary = "장애인전용주차구역은 주차표지 없는 차량의 주차와 주차 방해 행위가 금지됩니다.",
+        detail = "제17조 제4항은 장애인전용주차구역 주차표지가 없는 자동차의 주차를 금지하고, 표지가 있더라도 보행에 장애가 있는 사람이 타지 않은 경우도 금지합니다. 제5항은 물건을 쌓거나 통행로를 가로막는 등 주차 방해 행위를 금지합니다.",
+        note = "장애인전용주차구역에 비대상 차량이 주차했거나, 주차구역 또는 진입 통로를 막아 장애인 차량의 이용을 방해하는 경우에 해당합니다."
+    )
+    "소방차 전용구역" -> ViolationLawInfo(
+        lawName = "소방기본법",
+        article = "제21조의2",
+        summary = "소방자동차 전용구역에 주차하거나 전용구역 진입을 가로막는 방해행위가 금지됩니다.",
+        detail = "공동주택 중 대통령령으로 정하는 공동주택에는 소방자동차 전용구역을 설치해야 하며, 누구든지 전용구역에 차를 주차하거나 전용구역으로의 진입을 가로막는 등의 방해행위를 해서는 안 됩니다.",
+        note = "공동주택 등에서 소방자동차 전용구역 표시가 있는 공간에 주차했거나, 소방차가 들어갈 통로를 막은 경우에 해당합니다."
+    )
+    "친환경차 충전구역" -> ViolationLawInfo(
+        lawName = "환경친화적 자동차의 개발 및 보급 촉진에 관한 법률",
+        article = "제11조의2",
+        summary = "환경친화적 자동차 충전구역 또는 전용주차구역에서 비대상 차량 주차와 충전 방해 행위가 금지됩니다.",
+        detail = "제11조의2 제7항은 전기자동차 또는 외부 충전식 하이브리드자동차가 아닌 자동차의 충전구역 주차를 금지하고, 제8항은 전기자동차ㆍ하이브리드자동차ㆍ수소전기자동차가 아닌 자동차의 전용주차구역 주차를 금지합니다. 제9항은 물건 적치, 통행로 차단 등 충전 방해 행위를 금지합니다.",
+        note = "비대상 차량이 충전구역 또는 전용주차구역에 주차했거나, 물건 적치ㆍ통로 차단 등으로 충전을 방해하는 경우에 해당합니다."
+    )
+    else -> ViolationLawInfo(
+        lawName = "관련 법령",
+        article = "확인 필요",
+        summary = "선택한 신고 유형의 법령 근거를 확인해야 합니다.",
+        detail = "국가법령정보센터에서 법령명과 조문 번호를 기준으로 확인해야 합니다.",
+        note = "최종 적용 전 국가법령정보센터 기준으로 조문을 확인하세요."
+    )
+}
 
 // 홈 메뉴와 법령 카테고리 카드가 같은 시각 언어를 갖도록 공통 그라데이션 팔레트를 사용합니다.
 private val tileGradients = listOf(
@@ -2349,11 +2488,11 @@ private fun HomeScreen(
     reports: List<ReportHistoryItem>,
     profileImagePath: String,
     onReportClick: () -> Unit,
+    onLawsClick: () -> Unit,
     onHistoryClick: () -> Unit,
     onReportSelected: (ReportHistoryItem) -> Unit,
     onProfileClick: () -> Unit
 ) {
-    val context = LocalContext.current
     val threeMonthsAgo = Calendar.getInstance(Locale.KOREA).apply {
         add(Calendar.MONTH, -3)
     }.timeInMillis
@@ -2436,12 +2575,10 @@ private fun HomeScreen(
             )
             GradientMenuCard(
                 modifier = Modifier.weight(1f),
-                title = "마이페이지",
+                title = "관련법령",
                 subtitle = "신고 기준",
                 gradient = tileGradients[3],
-                onClick = {
-                    Toast.makeText(context, "도움말 화면은 다음 단계에서 추가됩니다.", Toast.LENGTH_SHORT).show()
-                }
+                onClick = onLawsClick
             )
         }
 
@@ -2494,6 +2631,267 @@ private fun HomeProfileAvatar(bitmap: Bitmap?, onClick: () -> Unit) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun RelatedLawsScreen(onBackClick: () -> Unit) {
+    var expandedCategory by remember { mutableStateOf<String?>(null) }
+    var expandedType by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(appBackgroundColor)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(modifier = Modifier.height(24.dp))
+        ProfileHomeButton(onClick = onBackClick)
+        Spacer(modifier = Modifier.height(22.dp))
+        Text(
+            text = "관련법령",
+            fontSize = 32.sp,
+            lineHeight = 38.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "신고 유형별 적용 법령과 기준을 확인할 수 있습니다.",
+            fontSize = 16.sp,
+            lineHeight = 23.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        violationCategories.forEach { category ->
+            val isCategoryExpanded = expandedCategory == category.name
+            LegalCategoryAccordion(
+                category = category,
+                expanded = isCategoryExpanded,
+                expandedType = expandedType,
+                onCategoryClick = {
+                    expandedCategory = if (isCategoryExpanded) null else category.name
+                    expandedType = null
+                },
+                onTypeClick = { type ->
+                    val typeKey = "${category.name}:$type"
+                    expandedType = if (expandedType == typeKey) null else typeKey
+                }
+            )
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun LegalCategoryAccordion(
+    category: ViolationCategory,
+    expanded: Boolean,
+    expandedType: String?,
+    onCategoryClick: () -> Unit,
+    onTypeClick: (String) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = appCardColor),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onCategoryClick)
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Text(
+                        text = category.name,
+                        fontSize = 16.sp,
+                        lineHeight = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = headingColor
+                    )
+                    Text(
+                        text = category.description,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = bodyTextColor
+                    )
+                }
+                AccordionChevron(expanded = expanded, color = headingColor)
+            }
+
+            if (expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 20.dp, end = 20.dp, bottom = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    category.types.forEach { type ->
+                        val typeKey = "${category.name}:$type"
+                        LegalInfoCard(
+                            type = type,
+                            expanded = expandedType == typeKey,
+                            onClick = { onTypeClick(type) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LegalInfoCard(
+    type: String,
+    expanded: Boolean,
+    onClick: () -> Unit
+) {
+    val lawInfo = lawInfoForViolation(type)
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(8.dp))
+                .clickable(onClick = onClick)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = type,
+                    modifier = Modifier.weight(1f),
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = headingColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                LawArticleBadge(
+                    text = compactLawLabel(type, lawInfo),
+                    modifier = Modifier
+                        .padding(start = 8.dp)
+                        .widthIn(max = 210.dp)
+                )
+                AccordionChevron(
+                    expanded = expanded,
+                    color = bodyTextColor,
+                    modifier = Modifier.padding(start = 10.dp)
+                )
+            }
+
+            if (expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFFF8FAFC))
+                        .padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = lawInfo.summary,
+                        fontSize = 12.sp,
+                        lineHeight = 19.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = headingColor
+                    )
+                    Text(
+                        text = lawInfo.detail,
+                        fontSize = 12.sp,
+                        lineHeight = 19.sp,
+                        fontWeight = FontWeight.Normal,
+                        color = bodyTextColor
+                    )
+                    Text(
+                        text = lawInfo.note,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFF64748B)
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun compactLawLabel(type: String, lawInfo: ViolationLawInfo): String = when (type) {
+    "장애인 전용구역" -> "장애인등 편의법 ${lawInfo.article}"
+    "친환경차 충전구역" -> "친환경자동차법 ${lawInfo.article}"
+    else -> "${lawInfo.lawName} ${lawInfo.article}"
+}
+
+@Composable
+private fun LawArticleBadge(
+    text: String,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .background(Color(0xFFEFF6FF), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 5.dp)
+    ) {
+        Text(
+            text = text,
+            fontSize = 11.sp,
+            lineHeight = 15.sp,
+            fontWeight = FontWeight.Bold,
+            color = primaryButtonColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun AccordionChevron(
+    expanded: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier.size(16.dp)) {
+        val strokeWidth = 2.dp.toPx()
+        val left = Offset(size.width * 0.24f, if (expanded) size.height * 0.60f else size.height * 0.40f)
+        val center = Offset(size.width * 0.50f, if (expanded) size.height * 0.35f else size.height * 0.65f)
+        val right = Offset(size.width * 0.76f, if (expanded) size.height * 0.60f else size.height * 0.40f)
+        drawLine(
+            color = color,
+            start = left,
+            end = center,
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = color,
+            start = center,
+            end = right,
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
     }
 }
 
@@ -3000,7 +3398,7 @@ private fun ReportHistoryRow(
                     color = bodyTextColor
                 )
                 Text(
-                    text = if (report == null) "-" else "${report.violationType} 쨌 ${report.plate}",
+                    text = if (report == null) "-" else "${report.violationType} ${report.plate}",
                     fontSize = 14.sp,
                     lineHeight = 18.sp,
                     fontWeight = FontWeight.Bold,
@@ -3021,7 +3419,8 @@ private fun ReportHistoryRow(
 @Composable
 private fun ReportHistoryDetailScreen(
     report: ReportHistoryItem,
-    onBackClick: () -> Unit
+    onBackClick: () -> Unit,
+    onHomeClick: () -> Unit
 ) {
     // 차량 사진은 여러 장을 "file1, file2" 형태로 저장하므로 상세 화면에서 파일명 배열로 다시 분리합니다.
     val photoFileNames = report.photoFileNames
@@ -3036,7 +3435,9 @@ private fun ReportHistoryDetailScreen(
             .padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Spacer(modifier = Modifier.height(30.dp))
+        Spacer(modifier = Modifier.height(24.dp))
+        ProfileHomeButton(onClick = onHomeClick)
+        Spacer(modifier = Modifier.height(20.dp))
 
         Text(
             text = "신고 상세 내역",
@@ -3075,6 +3476,8 @@ private fun ReportHistoryDetailScreen(
                 ReportInfoRow(label = "법령", value = report.categoryName.ifBlank { "미입력" })
                 ReportInfoRow(label = "위반 유형", value = report.violationType)
                 ReportInfoRow(label = "번호판", value = report.plate)
+                ReportInfoRow(label = "촬영 일시", value = formatPhotoCaptureTime(report.photoFileNames))
+                ReportInfoRow(label = "위치", value = report.location.ifBlank { "미입력" })
                 ReportInfoRow(label = "연락처", value = formatPhoneNumber(report.phoneNumber))
                 ReportInfoRow(label = "신고 내용", value = report.content.ifBlank { "입력한 내용 없음" })
             }
@@ -3104,7 +3507,9 @@ private fun ReportHistoryDetailScreen(
                     photoFileNames.forEachIndexed { index, fileName ->
                         SavedVehiclePhotoPreview(
                             title = "차량 사진 ${index + 1}",
-                            fileName = fileName
+                            fileName = fileName,
+                            violationType = report.violationType,
+                            phoneNumber = report.phoneNumber
                         )
                     }
                 }
@@ -3147,7 +3552,9 @@ private fun ReportInfoRow(
 @Composable
 private fun SavedVehiclePhotoPreview(
     title: String,
-    fileName: String
+    fileName: String,
+    violationType: String,
+    phoneNumber: String
 ) {
     val context = LocalContext.current
     // 신고 기록에는 파일명만 남기고, 실제 이미지는 촬영 당시 cacheDir에 저장된 파일을 읽어 표시합니다.
@@ -3157,7 +3564,7 @@ private fun SavedVehiclePhotoPreview(
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
-            text = "$title 쨌 $fileName",
+            text = "$title: $violationType / ${formatPhoneNumber(phoneNumber)}",
             fontSize = 13.sp,
             lineHeight = 18.sp,
             fontWeight = FontWeight.Bold,
@@ -3205,6 +3612,22 @@ private fun formatPhoneNumber(phoneNumber: String): String {
     } else {
         phoneNumber.ifBlank { "미입력" }
     }
+}
+
+private fun formatPhotoCaptureTime(photoFileNames: String): String {
+    val timestampRegex = Regex("""_(\d{8})_(\d{6})""")
+    val formattedTimes = photoFileNames
+        .split(",")
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .mapNotNull { fileName ->
+            val match = timestampRegex.find(fileName) ?: return@mapNotNull null
+            val date = match.groupValues[1]
+            val time = match.groupValues[2]
+            "${date.substring(0, 4)}/${date.substring(4, 6)}/${date.substring(6, 8)}/" +
+                "${time.substring(0, 2)}:${time.substring(2, 4)}:${time.substring(4, 6)}"
+        }
+    return formattedTimes.joinToString(", ").ifBlank { "촬영 시간 없음" }
 }
 
 // 메인 메뉴는 법령 선택처럼 같은 카드 패턴으로 보여주어 사용자가 선택 가능한 항목을 한눈에 파악하게 합니다.
@@ -3959,9 +4382,12 @@ private fun ReportDetailScreen(
     plate: String,
     content: String,
     phoneNumber: String,
+    location: String,
     onPlateChange: (String) -> Unit,
     onContentChange: (String) -> Unit,
     onPhoneNumberChange: (String) -> Unit,
+    onLocationChange: (String) -> Unit,
+    onMapClick: () -> Unit,
     onBackClick: () -> Unit,
     onNextClick: () -> Unit
 ) {
@@ -3971,106 +4397,152 @@ private fun ReportDetailScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .padding(horizontal = 20.dp)
     ) {
-        Spacer(modifier = Modifier.height(24.dp))
-        if (warningMessage.isNotBlank()) {
-            InlineWarningBanner(
-                modifier = Modifier.align(Alignment.CenterHorizontally),
-                message = warningMessage
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-        } else {
-            Spacer(modifier = Modifier.height(24.dp))
-        }
-        Text(
-            text = "신고 정보 확인",
-            fontSize = 30.sp,
-            lineHeight = 36.sp,
-            fontWeight = FontWeight.ExtraBold,
-            color = headingColor
-        )
-        Text(
-            text = "제출 전 번호판과 신고 유형을 확인해주세요",
-            fontSize = 17.sp,
-            lineHeight = 24.sp,
-            fontWeight = FontWeight.Medium,
-            color = bodyTextColor
-        )
-
-        Spacer(modifier = Modifier.height(18.dp))
-
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = violationType,
-            onValueChange = {},
-            label = { Text(text = "유형") },
-            singleLine = true,
-            readOnly = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
-            colors = inputColors
-        )
-
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = photoFileName,
-            onValueChange = {},
-            label = { Text(text = "첨부 사진") },
-            singleLine = true,
-            readOnly = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
-            colors = inputColors
-        )
-
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = plate,
-            onValueChange = onPlateChange,
-            label = { Text(text = "번호판 확인/수정") },
-            singleLine = true,
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
-            colors = inputColors
-        )
-
-        OutlinedTextField(
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(150.dp),
-            value = content,
-            onValueChange = onContentChange,
-            label = {
-                Text(
-                    text = "내용 (수정 가능, 5~900자)",
-                    fontSize = 13.sp
+                .weight(1f)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Spacer(modifier = Modifier.height(8.dp))
+            if (warningMessage.isNotBlank()) {
+                InlineWarningBanner(
+                    modifier = Modifier.align(Alignment.CenterHorizontally),
+                    message = warningMessage
                 )
-            },
-            placeholder = { Text(text = "불법 주정차 위반 사항을 신고해주세요") },
-            minLines = 5,
-            maxLines = 5,
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.Black),
-            colors = inputColors
-        )
+            }
+            Text(
+                text = "신고 정보 확인",
+                fontSize = 30.sp,
+                lineHeight = 36.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = headingColor
+            )
+            Text(
+                text = "제출 전 번호판과 신고 유형을 확인해주세요",
+                fontSize = 17.sp,
+                lineHeight = 24.sp,
+                fontWeight = FontWeight.Medium,
+                color = bodyTextColor
+            )
 
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = phoneNumber,
-            onValueChange = onPhoneNumberChange,
-            label = { Text(text = "내 전화") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            visualTransformation = PhoneNumberVisualTransformation,
-            placeholder = { Text(text = "010 - 1234 - 5678") },
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
-            colors = inputColors
-        )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = violationType,
+                onValueChange = {},
+                label = { Text(text = "유형") },
+                singleLine = true,
+                readOnly = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = inputColors
+            )
 
-        Spacer(modifier = Modifier.weight(1f))
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = photoFileName,
+                onValueChange = {},
+                label = { Text(text = "첨부 사진") },
+                singleLine = true,
+                readOnly = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = inputColors
+            )
+
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = formatPhotoCaptureTime(photoFileName),
+                onValueChange = {},
+                label = { Text(text = "촬영 일시") },
+                singleLine = true,
+                readOnly = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = inputColors
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    modifier = Modifier.weight(1f),
+                    value = location,
+                    onValueChange = onLocationChange,
+                    label = { Text(text = "위치") },
+                    singleLine = true,
+                    placeholder = { Text(text = "주소 또는 지도 선택 위치") },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                    colors = inputColors
+                )
+                Button(
+                    modifier = Modifier
+                        .widthIn(min = 104.dp)
+                        .height(56.dp),
+                    onClick = onMapClick,
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = primaryButtonColor,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Text(
+                        text = "지도 선택",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = plate,
+                onValueChange = onPlateChange,
+                label = { Text(text = "번호판 확인/수정") },
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = inputColors
+            )
+
+            OutlinedTextField(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(132.dp),
+                value = content,
+                onValueChange = onContentChange,
+                label = {
+                    Text(
+                        text = "내용 (수정 가능, 5~900자)",
+                        fontSize = 13.sp
+                    )
+                },
+                placeholder = { Text(text = "불법 주정차 위반 사항을 신고해주세요") },
+                minLines = 4,
+                maxLines = 4,
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.Black),
+                colors = inputColors
+            )
+
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = phoneNumber,
+                onValueChange = onPhoneNumberChange,
+                label = { Text(text = "휴대폰 번호") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                visualTransformation = PhoneNumberVisualTransformation,
+                placeholder = { Text(text = "010 - 1234 - 5678") },
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                colors = inputColors
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 24.dp),
+                .padding(top = 8.dp, bottom = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             PrimaryActionButton(
@@ -4092,6 +4564,415 @@ private fun ReportDetailScreen(
             )
         }
     }
+}
+
+@Composable
+private fun LocationPickerScreen(
+    currentLocation: String,
+    onLocationSelected: (String) -> Unit,
+    onBackClick: () -> Unit
+) {
+    val context = LocalContext.current
+    var selectedLocation by remember(currentLocation) {
+        mutableStateOf(currentLocation.ifBlank { "지도에서 위치를 선택해주세요" })
+    }
+    var locationStatus by remember { mutableStateOf("현재 위치를 확인하는 중입니다.") }
+    var hasLocationPermission by remember { mutableStateOf(hasLocationPermission(context)) }
+    var centerLatitude by remember { mutableStateOf(37.5665) }
+    var centerLongitude by remember { mutableStateOf(126.9780) }
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasLocationPermission = permissions.values.any { it }
+        if (!hasLocationPermission) {
+            locationStatus = "위치 권한이 없어 기본 위치를 표시합니다."
+            Toast.makeText(context, "위치 권한이 없어 기본 위치로 지도를 표시합니다.", Toast.LENGTH_SHORT).show()
+        } else {
+            locationStatus = "현재 위치를 확인하는 중입니다."
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (!hasLocationPermission) {
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    LaunchedEffect(hasLocationPermission) {
+        if (hasLocationPermission) {
+            val lastKnown = getLastKnownLatLng(context)
+            if (lastKnown != null) {
+                val (latitude, longitude) = lastKnown
+                centerLatitude = latitude
+                centerLongitude = longitude
+                locationStatus = "마지막으로 확인된 위치를 표시했습니다."
+            } else {
+                locationStatus = "현재 위치를 확인하는 중입니다."
+            }
+            requestFreshLatLng(
+                context = context,
+                onLocation = { latitude, longitude ->
+                    centerLatitude = latitude
+                    centerLongitude = longitude
+                    locationStatus = "현재 위치를 표시했습니다."
+                },
+                onUnavailable = {
+                    locationStatus = "현재 위치를 가져오지 못했습니다. 휴대폰 위치 서비스를 켠 뒤 다시 들어와주세요."
+                }
+            )
+        } else {
+            locationStatus = "위치 권한이 없어 기본 위치를 표시합니다."
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(appBackgroundColor)
+            .padding(horizontal = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Spacer(modifier = Modifier.height(8.dp))
+        ProfileHomeButton(onClick = onBackClick)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = "위치 선택",
+            fontSize = 28.sp,
+            lineHeight = 32.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = headingColor
+        )
+        Text(
+            text = "지도를 움직여 신고 위치를 가운데 핀에 맞춘 뒤 선택 완료를 눌러주세요.",
+            fontSize = 15.sp,
+            lineHeight = 20.sp,
+            fontWeight = FontWeight.Medium,
+            color = bodyTextColor
+        )
+        Text(
+            text = locationStatus,
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = primaryButtonColor
+        )
+
+        KakaoLocationPicker(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(310.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .border(1.dp, appBorderColor, RoundedCornerShape(8.dp)),
+            initialLatitude = centerLatitude,
+            initialLongitude = centerLongitude,
+            onCenterChanged = { latitude, longitude ->
+                selectedLocation = "위도 ${"%.6f".format(Locale.US, latitude)}, 경도 ${"%.6f".format(Locale.US, longitude)}"
+            }
+        )
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "선택 위치",
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = bodyTextColor
+                )
+                Text(
+                    text = selectedLocation,
+                    fontSize = 15.sp,
+                    lineHeight = 21.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = headingColor
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                text = "돌아가기",
+                onClick = onBackClick
+            )
+            PrimaryActionButton(
+                modifier = Modifier.weight(1f),
+                enabled = selectedLocation != "지도에서 위치를 선택해주세요",
+                text = "선택 완료",
+                onClick = { onLocationSelected(selectedLocation) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun KakaoLocationPicker(
+    modifier: Modifier = Modifier,
+    initialLatitude: Double,
+    initialLongitude: Double,
+    onCenterChanged: (Double, Double) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val isConfigured = remember { isKakaoMapConfigured(context) }
+    val mapViewState = remember { mutableStateOf<MapView?>(null) }
+    val kakaoMapState = remember { mutableStateOf<KakaoMap?>(null) }
+    var mapMessage by remember(isConfigured) {
+        mutableStateOf(
+            if (isConfigured) null else "카카오 네이티브 앱 키를 strings.xml에 입력해야 지도가 표시됩니다."
+        )
+    }
+
+    LaunchedEffect(initialLatitude, initialLongitude) {
+        onCenterChanged(initialLatitude, initialLongitude)
+        kakaoMapState.value?.moveCamera(
+            CameraUpdateFactory.newCenterPosition(
+                LatLng.from(initialLatitude, initialLongitude),
+                16
+            )
+        )
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            val mapView = mapViewState.value
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> mapView?.resume()
+                Lifecycle.Event.ON_PAUSE -> mapView?.pause()
+                Lifecycle.Event.ON_DESTROY -> mapView?.finish()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            mapViewState.value?.finish()
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .background(Color(0xFFE2E8F0))
+    ) {
+        if (isConfigured) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { viewContext ->
+                    MapView(viewContext).also { view ->
+                        mapViewState.value = view
+                        view.start(
+                            object : MapLifeCycleCallback() {
+                                override fun onMapDestroy() = Unit
+
+                                override fun onMapError(error: Exception) {
+                                    mapMessage = "카카오 지도 인증 오류입니다. 카카오 콘솔의 카카오맵 사용 설정, Android 패키지명, 키 해시를 확인해주세요. (${error.message ?: "원인 미상"})"
+                                }
+                            },
+                            object : KakaoMapReadyCallback() {
+                                override fun onMapReady(kakaoMap: KakaoMap) {
+                                    kakaoMapState.value = kakaoMap
+                                    val cameraPosition = kakaoMap.getCameraPosition()
+                                    val position = cameraPosition?.position
+                                    if (position != null) {
+                                        onCenterChanged(position.latitude, position.longitude)
+                                    }
+                                    kakaoMap.setOnCameraMoveEndListener(
+                                        object : KakaoMap.OnCameraMoveEndListener {
+                                            override fun onCameraMoveEnd(
+                                                kakaoMap: KakaoMap,
+                                                cameraPosition: CameraPosition,
+                                                gestureType: GestureType
+                                            ) {
+                                                val center = cameraPosition.position
+                                                onCenterChanged(center.latitude, center.longitude)
+                                            }
+                                        }
+                                    )
+                                }
+
+                                override fun getPosition(): LatLng =
+                                    LatLng.from(initialLatitude, initialLongitude)
+
+                                override fun getZoomLevel(): Int = 16
+                            }
+                        )
+                        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                            view.resume()
+                        }
+                    }
+                }
+            )
+        }
+
+        Canvas(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .size(44.dp)
+        ) {
+            val center = Offset(size.width / 2f, size.height * 0.34f)
+            drawCircle(
+                color = Color(0xFFEF4444),
+                radius = 13.dp.toPx(),
+                center = center
+            )
+            drawCircle(
+                color = Color.White,
+                radius = 5.dp.toPx(),
+                center = center
+            )
+            drawLine(
+                color = Color(0xFFEF4444),
+                start = Offset(size.width / 2f, size.height * 0.62f),
+                end = Offset(size.width / 2f, size.height * 0.94f),
+                strokeWidth = 4.dp.toPx(),
+                cap = StrokeCap.Round
+            )
+        }
+
+        mapMessage?.let { message ->
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(16.dp)
+                    .background(Color.White.copy(alpha = 0.94f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
+            ) {
+                Text(
+                    text = message,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = headingColor
+                )
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .padding(12.dp)
+                .background(Color.White.copy(alpha = 0.92f), RoundedCornerShape(8.dp))
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+        ) {
+            Text(
+                text = "가운데 핀을 신고 위치에 맞춰주세요.",
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = headingColor
+            )
+        }
+    }
+}
+
+private fun isKakaoMapConfigured(context: Context): Boolean {
+    val nativeKey = context.getString(R.string.kakao_native_app_key).trim()
+    return nativeKey.isNotBlank() && nativeKey != "YOUR_KAKAO_NATIVE_APP_KEY"
+}
+
+private fun hasLocationPermission(context: Context): Boolean =
+    ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+        PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+        PackageManager.PERMISSION_GRANTED
+
+@SuppressLint("MissingPermission")
+private fun requestFreshLatLng(
+    context: Context,
+    onLocation: (Double, Double) -> Unit,
+    onUnavailable: () -> Unit
+) {
+    if (!hasLocationPermission(context)) return
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+    val providers = listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER)
+        .filter { provider -> runCatching { locationManager.isProviderEnabled(provider) }.getOrDefault(false) }
+    if (providers.isEmpty()) {
+        onUnavailable()
+        return
+    }
+
+    var delivered = false
+    fun deliver(location: Location) {
+        if (!delivered) {
+            delivered = true
+            onLocation(location.latitude, location.longitude)
+        }
+    }
+
+    val handler = Handler(Looper.getMainLooper())
+    val timeout = Runnable {
+        if (!delivered) {
+            delivered = true
+            onUnavailable()
+        }
+    }
+    handler.postDelayed(timeout, 8000L)
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val executor = ContextCompat.getMainExecutor(context)
+        providers.forEach { provider ->
+            runCatching {
+                locationManager.getCurrentLocation(
+                    provider,
+                    CancellationSignal(),
+                    executor
+                ) { location ->
+                    location?.let {
+                        handler.removeCallbacks(timeout)
+                        deliver(it)
+                    }
+                }
+            }
+        }
+    } else {
+        lateinit var listener: android.location.LocationListener
+        listener = android.location.LocationListener { location ->
+            handler.removeCallbacks(timeout)
+            deliver(location)
+            runCatching { locationManager.removeUpdates(listener) }
+        }
+
+        providers.forEach { provider ->
+            runCatching {
+                locationManager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            }
+        }
+        handler.postDelayed(
+            { runCatching { locationManager.removeUpdates(listener) } },
+            8000L
+        )
+    }
+}
+
+@SuppressLint("MissingPermission")
+private fun getLastKnownLatLng(context: Context): Pair<Double, Double>? {
+    if (!hasLocationPermission(context)) return null
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+    val location: Location = providers
+        .mapNotNull { provider -> runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull() }
+        .maxByOrNull { it.time }
+        ?: return null
+    return location.latitude to location.longitude
 }
 
 @Composable
