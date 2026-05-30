@@ -4743,7 +4743,7 @@ private fun KakaoLocationPicker(
         )
     }
 
-    LaunchedEffect(initialLatitude, initialLongitude) {
+    LaunchedEffect(initialLatitude, initialLongitude, kakaoMapState.value) {
         onCenterChanged(initialLatitude, initialLongitude)
         kakaoMapState.value?.moveCamera(
             CameraUpdateFactory.newCenterPosition(
@@ -4791,11 +4791,12 @@ private fun KakaoLocationPicker(
                             object : KakaoMapReadyCallback() {
                                 override fun onMapReady(kakaoMap: KakaoMap) {
                                     kakaoMapState.value = kakaoMap
-                                    val cameraPosition = kakaoMap.getCameraPosition()
-                                    val position = cameraPosition?.position
-                                    if (position != null) {
-                                        onCenterChanged(position.latitude, position.longitude)
-                                    }
+                                    kakaoMap.moveCamera(
+                                        CameraUpdateFactory.newCenterPosition(
+                                            LatLng.from(initialLatitude, initialLongitude),
+                                            16
+                                        )
+                                    )
                                     kakaoMap.setOnCameraMoveEndListener(
                                         object : KakaoMap.OnCameraMoveEndListener {
                                             override fun onCameraMoveEnd(
@@ -4903,7 +4904,7 @@ private fun requestFreshLatLng(
 ) {
     if (!hasLocationPermission(context)) return
     val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
-    val providers = listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER)
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
         .filter { provider -> runCatching { locationManager.isProviderEnabled(provider) }.getOrDefault(false) }
     if (providers.isEmpty()) {
         onUnavailable()
@@ -4911,7 +4912,17 @@ private fun requestFreshLatLng(
     }
 
     var delivered = false
+    fun isUsableLocation(location: Location): Boolean {
+        val isDefaultSeoul =
+            kotlin.math.abs(location.latitude - 37.5665) < 0.0002 &&
+                kotlin.math.abs(location.longitude - 126.9780) < 0.0002
+        val isTooOld = System.currentTimeMillis() - location.time > 2 * 60 * 1000
+        val isTooCoarse = location.hasAccuracy() && location.accuracy > 500f
+        return !isDefaultSeoul && !isTooOld && !isTooCoarse
+    }
+
     fun deliver(location: Location) {
+        if (!isUsableLocation(location)) return
         if (!delivered) {
             delivered = true
             onLocation(location.latitude, location.longitude)
@@ -4937,8 +4948,10 @@ private fun requestFreshLatLng(
                     executor
                 ) { location ->
                     location?.let {
-                        handler.removeCallbacks(timeout)
                         deliver(it)
+                        if (delivered) {
+                            handler.removeCallbacks(timeout)
+                        }
                     }
                 }
             }
@@ -4946,9 +4959,11 @@ private fun requestFreshLatLng(
     } else {
         lateinit var listener: android.location.LocationListener
         listener = android.location.LocationListener { location ->
-            handler.removeCallbacks(timeout)
             deliver(location)
-            runCatching { locationManager.removeUpdates(listener) }
+            if (delivered) {
+                handler.removeCallbacks(timeout)
+                runCatching { locationManager.removeUpdates(listener) }
+            }
         }
 
         providers.forEach { provider ->
